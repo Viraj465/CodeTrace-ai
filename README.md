@@ -8,7 +8,7 @@ Unlike standard AI coding assistants that rely on naive text chunking, Codetrace
 
 ## 🎥 Action in Demo
 
-https://github.com/Viraj465/CodeTrace-ai/blob/main/CLI-video.mp4
+![Action in Demo](https://www.youtube.com/watch?v=p2KxkdbD93s)
 
 ---
 
