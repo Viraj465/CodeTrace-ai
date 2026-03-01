@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codetrace-ai"
+version = "0.1.0"
+description = "A Static + LLM Hybrid CLI for reverse-engineering legacy codebases."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "Viraj Sawant", email = "sawantviraj465@gmail.com"}
+]
+keywords = ["cli", "ai", "static-analysis", "llm", "langgraph", "codetrace"]
+
+# These are derived from your specific library list
+dependencies = [
+    "rich>=14.3.3",
+    "pydantic>=2.12.5",
+    "typer[all]>=0.24.1",
+    "langchain>=1.2.10",
+    "langchain-core>=1.2.16",
+    "langchain-groq>=1.1.2",
+    "langchain-community>=0.4.1",
+    "langchain-chroma>=1.1.0",
+    "python-dotenv>=1.2.1",
+    "tree-sitter>=0.25.2",
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "tree-sitter-java",
+    "tree-sitter-go",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-rust",
+    "tree-sitter-php",
+    "tree-sitter-html",
+    "tree-sitter-json",
+    "tree-sitter-css",
+    # "tree-sitter-dart-orchard",
+    "torch==2.5.1",
+    "sentence-transformers==3.4.1",
+    "transformers==4.48.3",
+    "langchain-huggingface>=1.2.0",
+    "langchain-google-genai>=4.2.1",
+    "langchain-openai>=1.1.10",
+    "langchain-anthropic>=1.3.4",
+    "chromadb>=1.5.2",
+    "networkx>=3.6.1",
+    "fastapi>=0.134.0",
+    "langgraph>=1.0.10",
+    "langsmith>=0.7.9",
+    "watchfiles>=1.1.1",
+    "tiktoken>=0.12.0",
+    "uvicorn>=0.41.0",
+    "markitdown>=0.1.5",
+    "nest-asyncio>=1.6.0",
+    "pyvis>=0.3.2",
+    "flashrank>=0.2.10",
+    "mcp>=1.26.0",
+    "langchain-ollama>=1.0.1"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "black",
+    "isort"
+]
+
+[project.scripts]
+# This is the "Magic Link"
+# Command 'codetrace' will run the 'app' object inside 'src/main.py'
+codetrace = "src.cli.main:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "codetrace_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -1,0 +1,22 @@
+
+EXTENSIONS_MAP = {
+    ".py": "python",
+    ".js": "javascript",
+    ".jsx": "javascript",
+    ".ts": "typescript",
+    ".tsx": "tsx",
+    ".java": "java",
+    ".cpp": "cpp",
+    ".cc": "cpp",
+    ".cxx": "cpp",
+    ".c++": "cpp",
+    ".c": "c",
+    ".go": "go",
+    ".rs": "rust",
+    ".php": "php",
+    # ".dart": "dart",
+    ".html": "html",
+    ".htm": "html",
+    ".json": "json",
+    ".css": "css",
+}
