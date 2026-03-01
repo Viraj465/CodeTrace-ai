@@ -46,3 +46,4 @@ MANIFEST
 *.swo
 *~
 .DS_Store
+*.zip

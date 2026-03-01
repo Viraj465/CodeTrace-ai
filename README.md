@@ -6,11 +6,9 @@ Codetrace-ai is a deeply integrated, privacy-first AI agent that understands you
 
 Unlike standard AI coding assistants that rely on naive text chunking, Codetrace builds a **"Hybrid Brain"**—combining a semantic Vector Database (ChromaDB) with a structural Graph Database (SQLite + NetworkX) using Tree-sitter. It doesn't just read your code; it understands what calls what, who owns what, and what breaks if you change something.
 
-## 🎥 Action in demo
+## 🎥 Action in Demo
 
-<video src="CLI-video.mp4" controls="controls" width="100%">
-  Your browser does not support the video tag.
-</video>
+https://github.com/Viraj465/CodeTrace-ai/blob/main/CLI-video.mp4
 
 ---
 
@@ -86,6 +84,21 @@ Codetrace-ai acts as a **Model Context Protocol (MCP)** server. Running `codetra
 
 Once connected, your IDE gains access to specialized tools:
 `search_codebase` (semantic search) • `get_symbol_relations` (call graphs) • `analyze_impact` (blast radius) • `write_file` (propose edits) • `git_diff` 
+
+**Using Windsurf?**
+Windsurf does not support auto-registration yet. You can add Codetrace manually. 
+1. Open your `mcp.json` file in Windsurf.
+2. Add the following to your `mcpServers` block:
+```json
+"codetrace": {
+  "command": "python",
+  "args": [
+    "/absolute/path/to/your/project/codetrace_mcp/server.py",
+    "--project",
+    "/absolute/path/to/your/project"
+  ]
+}
+```
 
 ---
 
