@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Codetrace-ai | Autonomous System Architect</title>
+    <meta name="description"
+        content="Codetrace-ai is a deeply integrated, privacy-first AI agent that understands your entire codebase.">
+
+    <!-- Favicon -->
+    <link rel="icon" type="image/png" href="CLI-Image.png">
+
+    <!-- Google Fonts: Roboto for Material Design -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;700;800&family=Roboto+Mono:wght@400;500&display=swap"
+        rel="stylesheet">
+
+    <!-- Material Symbols -->
+    <link
+        href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200"
+        rel="stylesheet" />
+
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+    <!-- App Bar -->
+    <header class="top-app-bar">
+        <div class="logo">
+            <img src="CLI-Image.png" alt="Codetrace-ai Logo" class="logo-img">
+            <span class="logo-text">Codetrace<span class="accent">-ai</span></span>
+        </div>
+        <nav>
+            <a href="#features" class="nav-link">Features</a>
+            <a href="#privacy" class="nav-link">Privacy</a>
+            <a href="#quickstart" class="nav-link">Quick Start</a>
+            <a href="https://github.com/Viraj465/CodeTrace-ai" target="_blank" class="btn btn-filled">GitHub</a>
+        </nav>
+    </header>
+
+    <main>
+        <!-- Hero Section -->
+        <section class="hero">
+            <div class="hero-content">
+                <div class="badge">v1.0 Available Now</div>
+                <h1 class="hero-title">The Autonomous <br /><span class="text-gradient">System Architect</span></h1>
+                <p class="hero-subtitle">For your Terminal and IDE.</p>
+                <p class="hero-body">Codetrace-ai is a deeply integrated, privacy-first AI agent that understands your
+                    entire codebase. It builds a "Hybrid Brain" combining semantic DBs with structural Graphs to know
+                    what calls what and what breaks if you change something.</p>
+
+                <div class="hero-actions">
+                    <div class="code-snippet install-snippet">
+                        <code>pip install codetrace-ai</code>
+                        <button class="icon-btn copy-btn" aria-label="Copy code" data-copy="pip install codetrace-ai">
+                            <span class="material-symbols-rounded">content_copy</span>
+                        </button>
+                    </div>
+                    <div class="hero-buttons">
+                        <a href="https://www.youtube.com/watch?v=p2KxkdbD93s&t=2s" target="_blank"
+                            class="btn btn-filled">
+                            <span class="material-symbols-rounded" style="margin-right: 8px;">play_circle</span> Watch
+                            Demo
+                        </a>
+                        <a href="https://pypi.org/project/codetrace-ai/" target="_blank" class="btn btn-outlined">
+                            <span class="material-symbols-rounded" style="margin-right: 8px;">package</span> View on
+                            PyPI
+                        </a>
+                    </div>
+                </div>
+            </div>
+            <div class="hero-visual">
+                <div class="glass-terminal">
+                    <div class="terminal-header">
+                        <div class="dot red"></div>
+                        <div class="dot yellow"></div>
+                        <div class="dot green"></div>
+                        <div class="terminal-title">bash</div>
+                    </div>
+                    <div class="terminal-body" id="typewriter">
+                        <span class="prompt">$</span> codetrace init<br />
+                        <span class="output dim">[+] Initializing Hybrid Brain...</span><br />
+                        <span class="output dim">[+] Vector Database (ChromaDB) Ready</span><br />
+                        <span class="output dim">[+] Structural Graph (NetworkX) Mapped</span><br />
+                        <span class="output success">Codetrace-ai is ready.</span><br />
+                        <span class="prompt">$</span> codetrace chat<br />
+                        <span class="output">How can I help you architect today?</span><span class="cursor"></span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Features Section -->
+        <section id="features" class="section">
+            <div class="section-header">
+                <h2>What Codetrace Can Do For You</h2>
+                <p>Acts as a highly knowledgeable senior engineer on your project.</p>
+            </div>
+            <div class="grid features-grid">
+                <!-- Feature 1 -->
+                <div class="card md-elevation-1">
+                    <div class="card-icon-wrapper">
+                        <span class="material-symbols-rounded icon-primary">travel_explore</span>
+                    </div>
+                    <h3>Autonomous Research</h3>
+                    <p>Ask a question, and the agent proactively uses tools to search, read files, and analyze the
+                        codebase to find the exact answer.</p>
+                </div>
+                <!-- Feature 2 -->
+                <div class="card md-elevation-1">
+                    <div class="card-icon-wrapper">
+                        <span class="material-symbols-rounded icon-primary">account_tree</span>
+                    </div>
+                    <h3>Structural Call Graphs</h3>
+                    <p>Navigates class and function definitions across 6+ languages (Python, JS, TS, Java, C++, Go) to
+                        see exactly how your application is wired.</p>
+                </div>
+                <!-- Feature 3 -->
+                <div class="card md-elevation-1">
+                    <div class="card-icon-wrapper">
+                        <span class="material-symbols-rounded icon-primary">crisis_alert</span>
+                    </div>
+                    <h3>Blast Radius Analysis</h3>
+                    <p>Analyzes the impact of code modifications before you make them, preventing unintended breakages
+                        across your system.</p>
+                </div>
+                <!-- Feature 4 -->
+                <div class="card md-elevation-1">
+                    <div class="card-icon-wrapper">
+                        <span class="material-symbols-rounded icon-primary">draw</span>
+                    </div>
+                    <h3>Proposing Code Edits</h3>
+                    <p>Automatically writes and presents interactive code changes in the terminal, giving you a diff
+                        preview to approve or decline before saving.</p>
+                </div>
+                <!-- Feature 5 -->
+                <div class="card md-elevation-1">
+                    <div class="card-icon-wrapper">
+                        <span class="material-symbols-rounded icon-primary">sync</span>
+                    </div>
+                    <h3>Smart Delta Syncing</h3>
+                    <p>Reacts to changes in your code using SHA-256 hashing to lightning-fast re-indexes only the files
+                        you touched.</p>
+                </div>
+                <!-- Feature 6 -->
+                <div class="card md-elevation-1">
+                    <div class="card-icon-wrapper">
+                        <span class="material-symbols-rounded icon-primary">integration_instructions</span>
+                    </div>
+                    <h3>IDE Context (MCP)</h3>
+                    <p>Connects its powerful hybrid brain directly into Cursor, Windsurf, or Claude Code for in-editor
+                        assistance instantaneously.</p>
+                </div>
+            </div>
+        </section>
+
+        <!-- Privacy Section -->
+        <section id="privacy" class="section alt-bg">
+            <div class="split-layout">
+                <div class="split-content">
+                    <span class="overline">Privacy-First Architecture</span>
+                    <h2>100% Local and Air-Gapped Capable</h2>
+                    <p>All parsing, embedding, and graph mapping happens directly on your machine. It can be used 100%
+                        offline with zero internet connection.</p>
+                    <ul class="check-list">
+                        <li>
+                            <span class="material-symbols-rounded list-icon">check_circle</span>
+                            <span><strong>Local LLM Required:</strong> Configure a local model via options like Ollama
+                                (llama3.2, deepseek-coder).</span>
+                        </li>
+                        <li>
+                            <span class="material-symbols-rounded list-icon">check_circle</span>
+                            <span><strong>True Air-Gapped Setup:</strong> Transfer cached embedding models via USB for
+                                completely offline environments.</span>
+                        </li>
+                        <li>
+                            <span class="material-symbols-rounded list-icon">check_circle</span>
+                            <span><strong>Offline Flag:</strong> Use <code>--offline</code> to strictly block internal
+                                telemetry and external requests.</span>
+                        </li>
+                    </ul>
+                </div>
+                <div class="split-visual">
+                    <div class="shield-graphic">
+                        <span class="material-symbols-rounded huge-icon">shield_lock</span>
+                        <div class="pulse-ring"></div>
+                        <div class="pulse-ring delay"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Quick Start & Commands Section -->
+        <section id="quickstart" class="section">
+            <div class="section-header">
+                <h2>Frictionless Setup</h2>
+                <p>Get up and running in seconds. Navigate to any local codebase and type:</p>
+            </div>
+
+            <div class="workflow-container">
+                <div class="code-block md-elevation-2">
+                    <div class="code-block-header">
+                        <span>Terminal</span>
+                    </div>
+                    <pre><code><span class="dim"># Navigate to your project</span>
+cd /path/to/your/project
+
+<span class="dim"># Configure provider, download models, index code, and register MCP</span>
+codetrace init
+
+<span class="dim"># Launch interactive autonomous AI chat loop</span>
+codetrace chat</code></pre>
+                </div>
+            </div>
+
+            <h3 class="subsection-title">CLI Command Reference</h3>
+            <div class="commands-list md-elevation-1">
+                <div class="command-item">
+                    <div class="cmd-name"><code>codetrace init</code></div>
+                    <div class="cmd-desc">Configures the LLM provider, downloads models, indexes the codebase, and
+                        registers MCP.</div>
+                </div>
+                <div class="command-item">
+                    <div class="cmd-name"><code>codetrace chat</code></div>
+                    <div class="cmd-desc">Launches the interactive autonomous AI chat loop for your codebase.</div>
+                </div>
+                <div class="command-item">
+                    <div class="cmd-name"><code>codetrace index &lt;PATH&gt;</code></div>
+                    <div class="cmd-desc">Forces a re-scan of a local folder or clones and indexes a GitHub URL.</div>
+                </div>
+                <div class="command-item">
+                    <div class="cmd-name"><code>codetrace config</code></div>
+                    <div class="cmd-desc">View or update your LLM provider and API key configuration.</div>
+                </div>
+                <div class="command-item">
+                    <div class="cmd-name"><code>codetrace visualize</code></div>
+                    <div class="cmd-desc">Generates and opens an interactive HTML graph map of your code architecture.
+                    </div>
+                </div>
+                <div class="command-item">
+                    <div class="cmd-name"><code>codetrace history</code></div>
+                    <div class="cmd-desc">Lists all past architectural chat sessions for the current project.</div>
+                </div>
+                <div class="command-item">
+                    <div class="cmd-name"><code>codetrace export &lt;ID&gt;</code></div>
+                    <div class="cmd-desc">Exports a specific chat session to the terminal or saves it as a Markdown
+                        file.</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Open Source Section -->
+        <section id="opensource" class="section">
+            <div class="build-card md-elevation-2" style="border-color: rgba(255, 255, 255, 0.1); margin-bottom: 2rem;">
+                <div class="build-content">
+                    <span class="material-symbols-rounded huge-icon"
+                        style="margin-bottom: 1rem; font-size: 48px; background: none; color: var(--md-sys-color-primary); -webkit-text-fill-color: initial;">code</span>
+                    <h2>Proudly Open Source</h2>
+                    <p>Codetrace-ai is an open-source project. We believe in building in public and welcome
+                        contributions from the community.</p>
+                    <p class="dim mt-2">Whether it's reporting bugs, improving documentation, or adding new
+                        features—your help is highly appreciated!</p>
+                    <div style="margin-top: 2rem;">
+                        <a href="https://github.com/Viraj465/CodeTrace-ai" target="_blank" class="btn btn-filled">
+                            <span class="material-symbols-rounded" style="margin-right: 8px;">open_in_new</span>
+                            Contribute on GitHub
+                        </a>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <!-- IDE Integration -->
+        <section class="section build-section">
+            <div class="build-card md-elevation-3">
+                <div class="build-content">
+                    <h2>Seamless IDE Integration</h2>
+                    <p>Codetrace-ai acts as a <strong>Model Context Protocol (MCP)</strong> server. Running
+                        <code>codetrace init</code> automatically installs this configuration into Cursor and Claude
+                        Code.
+                    </p>
+                    <p class="dim mt-2">Tools injected: <span class="badge-small">search_codebase</span> <span
+                            class="badge-small">get_symbol_relations</span> <span
+                            class="badge-small">analyze_impact</span> <span class="badge-small">write_file</span> <span
+                            class="badge-small">git_diff</span></p>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <div class="footer-content footer-grid">
+            <div class="footer-col brand-col">
+                <div class="logo">
+                    <img src="CLI-Image.png" alt="Codetrace-ai Logo" class="logo-img">
+                    <span class="logo-text">Codetrace<span class="accent">-ai</span></span>
+                </div>
+                <p class="tagline">The Autonomous System Architect for your Terminal and IDE.</p>
+                <div class="footer-badges">
+                    <span class="badge-small">v1.0</span>
+                    <span class="badge-small"
+                        style="background: rgba(40, 199, 111, 0.1); color: #28c76f; border: 1px solid rgba(40, 199, 111, 0.2)">Privacy-First</span>
+                </div>
+            </div>
+
+            <div class="footer-col">
+                <h4 class="footer-title">Quick Links</h4>
+                <a href="#features" class="footer-link">Features</a>
+                <a href="#privacy" class="footer-link">Air-gapped Setup</a>
+                <a href="#quickstart" class="footer-link">Quick Start</a>
+                <a href="#opensource" class="footer-link">Open Source</a>
+            </div>
+
+            <div class="footer-col">
+                <h4 class="footer-title">Resources</h4>
+                <a href="https://github.com/Viraj465/CodeTrace-ai/blob/main/README.md" target="_blank"
+                    class="footer-link">Documentation (README)</a>
+                <a href="https://github.com/Viraj465/CodeTrace-ai/blob/main/COMMANDS.md" target="_blank"
+                    class="footer-link">CLI Commands</a>
+                <a href="https://github.com/Viraj465/CodeTrace-ai/blob/main/CONTRIBUTING.md" target="_blank"
+                    class="footer-link">Contributing Guide</a>
+                <a href="https://github.com/Viraj465/CodeTrace-ai/blob/main/LICENSE" target="_blank"
+                    class="footer-link">License</a>
+            </div>
+
+            <div class="footer-col">
+                <h4 class="footer-title">Community</h4>
+                <a href="https://github.com/Viraj465/CodeTrace-ai" target="_blank" class="footer-link">GitHub
+                    Repository</a>
+                <a href="https://pypi.org/project/codetrace-ai/" target="_blank" class="footer-link">PyPI Package</a>
+                <a href="https://www.youtube.com/watch?v=p2KxkdbD93s&t=2s" target="_blank" class="footer-link">YouTube
+                    Demo</a>
+                <a href="https://github.com/Viraj465/CodeTrace-ai/issues" target="_blank" class="footer-link">Issue
+                    Tracker</a>
+            </div>
+        </div>
+        <div class="footer-bottom">
+            <div class="logo" style="opacity: 0.7; transform: scale(0.9); transform-origin: left center;">
+                <img src="CLI-Image.png" alt="Codetrace-ai Logo" class="logo-img">
+                <span class="logo-text">Codetrace<span class="accent">-ai</span></span>
+            </div>
+            <p class="copyright">&copy; 2026 Codetrace-ai. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <script src="script.js"></script>
+</body>
+
+</html>
