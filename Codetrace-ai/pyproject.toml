@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codetrace-ai"
-version = "0.1.0"
+version = "0.1.2"
 description = "A Static + LLM Hybrid CLI for reverse-engineering legacy codebases."
 readme = "README.md"
 requires-python = ">=3.10"
