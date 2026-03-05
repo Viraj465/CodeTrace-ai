@@ -1,5 +1,9 @@
 # 🧠 Codetrace-ai
 
+[![PyPI version](https://img.shields.io/pypi/v/codetrace-ai.svg)](https://pypi.org/project/codetrace-ai/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Downloads](https://static.pepy.tech/badge/codetrace-ai)](https://pepy.tech/project/codetrace-ai)
+
 **The Autonomous System Architect for your Terminal and IDE.**
 
 Codetrace-ai is a deeply integrated, privacy-first AI agent that understands your entire codebase. 

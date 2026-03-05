@@ -338,6 +338,12 @@ class AgentOrchestrator:
         Synchronous wrapper around astream() for use in non-async CLI code.
         Creates its own event loop if needed.
         """
+        import warnings
+        
+        # Suppress the RuntimeWarning from aiohttp about unawaited coroutines
+        # This is a known issue when langgraph/langchain closes HTTP connections
+        warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*coroutine.*was never awaited")
+        
         async def _collect():
             events = []
             async for event in self.astream(query, chat_history):
