@@ -12,7 +12,11 @@ license = {text = "MIT"}
 authors = [
     {name = "Viraj Sawant", email = "sawantviraj465@gmail.com"}
 ]
-keywords = ["cli", "ai", "static-analysis", "llm", "langgraph", "codetrace"]
+# 👇 Updated Keywords List
+keywords = [
+    "cli", "ai", "static-analysis", "llm", "langgraph", "codetrace", "sqlite3",
+    "reverse-engineering", "mcp", "tree-sitter", "rag", "agent", "chromadb"
+]
 
 # These are derived from your specific library list
 dependencies = [
@@ -61,6 +65,12 @@ dependencies = [
     "mcp>=1.26.0",
     "langchain-ollama>=1.0.1"
 ]
+
+[project.urls]
+"Homepage" = "https://github.com/Viraj465/codetrace-ai"
+"Repository" = "https://github.com/Viraj465/codetrace-ai"
+"Bug Tracker" = "https://github.com/Viraj465/codetrace-ai/issues"
+"Changelog" = "https://github.com/Viraj465/codetrace-ai/releases"
 
 [project.optional-dependencies]
 dev = [
