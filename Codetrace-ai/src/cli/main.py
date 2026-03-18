@@ -733,17 +733,11 @@ def visualize(path: str = typer.Argument(".", help="Target directory")):
             raise typer.Exit(1)
 
         net = Network(
-            height="100%",
+            height="900px",
             width="100%",
             directed=True,
-            bgcolor="#1a1a2e",
-            font_color="#e0e0e0",
-        )
-        net.barnes_hut(
-            gravity=-3000,
-            central_gravity=0.3,
-            spring_length=150,
-            spring_strength=0.01,
+            bgcolor="#0f172a",
+            font_color="#e2e8f0",
         )
 
         # Color palette by node type
@@ -756,6 +750,20 @@ def visualize(path: str = typer.Argument(".", help="Target directory")):
             "unknown":   "#90a4ae",   # grey
         }
 
+        project_node_id = f"project:{target_dir.name}"
+        net.add_node(
+            project_node_id,
+            label=target_dir.name,
+            title=f"Project: {target_dir}",
+            color="#f43f5e",
+            size=28,
+            shape="diamond",
+            level=0,
+        )
+
+        dir_node_ids: dict[str, str] = {}
+        file_node_ids: dict[str, str] = {}
+        file_levels: dict[str, int] = {}
         for node, data in graph.direct_graph.nodes(data=True):
             n_type = data.get("type", "unknown")
             n_file = data.get("file", "")
@@ -763,6 +771,71 @@ def visualize(path: str = typer.Argument(".", help="Target directory")):
             label = node.split(":")[-1] if ":" in node else node
             color = type_colors.get(n_type, type_colors["unknown"])
 
+            file_path_str = str(n_file) if n_file else "<unknown>"
+            if file_path_str not in file_node_ids:
+                file_node_id = f"file:{file_path_str}"
+                file_node_ids[file_path_str] = file_node_id
+                file_name = Path(file_path_str).name if file_path_str != "<unknown>" else "<unknown>"
+
+                parent_node_id = project_node_id
+                level = 1
+                if file_path_str != "<unknown>":
+                    try:
+                        rel_parts = Path(file_path_str).resolve().relative_to(target_dir.resolve()).parts
+                    except Exception:
+                        rel_parts = Path(file_path_str).parts
+
+                    dir_parts = rel_parts[:-1] if len(rel_parts) > 1 else []
+                    current_rel = ""
+                    for part in dir_parts:
+                        current_rel = f"{current_rel}/{part}" if current_rel else part
+                        dir_node_id = f"dir:{current_rel}"
+                        if dir_node_id not in dir_node_ids:
+                            dir_node_ids[dir_node_id] = dir_node_id
+                            net.add_node(
+                                dir_node_id,
+                                label=part,
+                                title=f"Directory: {current_rel}",
+                                color="#2dd4bf",
+                                size=18,
+                                shape="ellipse",
+                                level=level,
+                            )
+                            net.add_edge(
+                                parent_node_id,
+                                dir_node_id,
+                                title="contains",
+                                kind="structure",
+                                color="#64748b",
+                                arrows="to",
+                                width=1.2,
+                                dashes=True,
+                            )
+                        parent_node_id = dir_node_id
+                        level += 1
+
+                net.add_node(
+                    file_node_id,
+                    label=file_name,
+                    title=f"File: {file_path_str}",
+                    color="#a78bfa",
+                    size=16,
+                    shape="box",
+                    level=level,
+                )
+                net.add_edge(
+                    parent_node_id,
+                    file_node_id,
+                    title="contains",
+                    kind="structure",
+                    color="#64748b",
+                    arrows="to",
+                    width=1.2,
+                    dashes=True,
+                )
+                file_levels[file_path_str] = level
+
+            symbol_level = file_levels.get(file_path_str, 2)
             net.add_node(
                 node,
                 label=label,
@@ -770,7 +843,21 @@ def visualize(path: str = typer.Argument(".", help="Target directory")):
                 color=color,
                 size=20 if n_type == "class" else 12,
                 shape="dot",
+                level=symbol_level + (2 if n_type == "method" else 1),
             )
+
+            parent_file_node = file_node_ids.get(file_path_str)
+            if parent_file_node:
+                net.add_edge(
+                    parent_file_node,
+                    node,
+                    title="defines",
+                    kind="structure",
+                    color="#94a3b8",
+                    arrows="to",
+                    width=1.1,
+                    dashes=True,
+                )
 
         # Edge colors by relation
         edge_colors = {
@@ -783,18 +870,194 @@ def visualize(path: str = typer.Argument(".", help="Target directory")):
             net.add_edge(
                 src, tgt,
                 title=relation,
-                color=edge_colors.get(relation, "#666666"),
+                kind="semantic",
+                color=edge_colors.get(relation, "#38bdf8"),
                 arrows="to",
-                width=1.5,
+                width=2.0 if relation == "calls" else 1.6,
             )
+
+        net.set_options(
+            """
+            var options = {
+              "layout": {
+                "hierarchical": {
+                  "enabled": true,
+                  "direction": "UD",
+                  "sortMethod": "directed",
+                  "nodeSpacing": 220,
+                  "treeSpacing": 240,
+                  "levelSeparation": 140,
+                  "blockShifting": true,
+                  "edgeMinimization": true,
+                  "parentCentralization": true,
+                  "shakeTowards": "roots"
+                }
+              },
+              "physics": {
+                "enabled": false
+              },
+              "interaction": {
+                "hover": true,
+                "navigationButtons": true,
+                "keyboard": true
+              },
+              "nodes": {
+                "font": {
+                  "size": 18,
+                  "face": "Consolas"
+                }
+              },
+              "edges": {
+                "smooth": false
+              }
+            }
+            """
+        )
 
         output_path = db_dir / "graph_visualization.html"
         net.save_graph(str(output_path))
+
+        # Inject click-to-expand tree behavior into the generated HTML.
+        html = output_path.read_text(encoding="utf-8")
+        interaction_script = f"""
+<script type="text/javascript">
+(function () {{
+  if (typeof network === "undefined" || typeof nodes === "undefined" || typeof edges === "undefined") {{
+    return;
+  }}
+
+  const ROOT_ID = {project_node_id!r};
+  const allNodes = nodes.get();
+  const allEdges = edges.get();
+  const childrenByParent = {{}};
+  const expanded = {{}};
+  const visible = new Set([ROOT_ID]);
+
+  for (const e of allEdges) {{
+    if (e.kind === "structure") {{
+      if (!childrenByParent[e.from]) {{
+        childrenByParent[e.from] = [];
+      }}
+      childrenByParent[e.from].push(e.to);
+    }}
+  }}
+
+  function setInitialState() {{
+    const nodeUpdates = allNodes.map((n) => {{
+      const hasChildren = (childrenByParent[n.id] || []).length > 0;
+      const baseLabel = n.label || String(n.id);
+      return {{
+        id: n.id,
+        hidden: n.id !== ROOT_ID,
+        label: hasChildren ? baseLabel + " [+]" : baseLabel,
+      }};
+    }});
+    nodes.update(nodeUpdates);
+
+    const edgeUpdates = allEdges.map((e) => ({{
+      id: e.id,
+      hidden: true,
+    }}));
+    edges.update(edgeUpdates);
+
+    network.fit({{ nodes: [ROOT_ID], animation: false }});
+  }}
+
+  function updateEdges() {{
+    const updates = allEdges.map((e) => {{
+      const bothVisible = visible.has(e.from) && visible.has(e.to);
+      return {{ id: e.id, hidden: !bothVisible }};
+    }});
+    edges.update(updates);
+  }}
+
+  function collapseSubtree(nodeId) {{
+    const queue = [...(childrenByParent[nodeId] || [])];
+    while (queue.length) {{
+      const current = queue.shift();
+      visible.delete(current);
+      expanded[current] = false;
+      for (const child of (childrenByParent[current] || [])) {{
+        queue.push(child);
+      }}
+    }}
+    const updates = allNodes
+      .filter((n) => n.id !== ROOT_ID)
+      .map((n) => ({{
+        id: n.id,
+        hidden: !visible.has(n.id),
+      }}));
+    nodes.update(updates);
+  }}
+
+  function toggleNode(nodeId) {{
+    const children = childrenByParent[nodeId] || [];
+    if (!children.length) {{
+      return;
+    }}
+
+    if (expanded[nodeId]) {{
+      collapseSubtree(nodeId);
+      expanded[nodeId] = false;
+    }} else {{
+      for (const child of children) {{
+        visible.add(child);
+      }}
+      nodes.update(children.map((id) => ({{
+        id,
+        hidden: false,
+      }})));
+      expanded[nodeId] = true;
+    }}
+
+    const current = nodes.get(nodeId);
+    if (current) {{
+      const base = String(current.label || "").replace(" [+]", "").replace(" [-]", "");
+      nodes.update({{ id: nodeId, label: base + (expanded[nodeId] ? " [-]" : " [+]") }});
+    }}
+
+    updateEdges();
+    const nodePos = network.getPosition(nodeId);
+    network.moveTo({{
+      position: nodePos,
+      scale: Math.max(network.getScale(), 1.0),
+      animation: {{ duration: 220 }}
+    }});
+  }}
+
+  network.on("click", function (params) {{
+    if (!params.nodes || !params.nodes.length) {{
+      return;
+    }}
+    toggleNode(params.nodes[0]);
+  }});
+
+  setInitialState();
+  network.setOptions({{
+    layout: {{
+      hierarchical: {{
+        enabled: true,
+        direction: "UD",
+        nodeSpacing: 220,
+        treeSpacing: 240,
+        levelSeparation: 140,
+        parentCentralization: true,
+        blockShifting: true,
+        edgeMinimization: true
+      }}
+    }}
+  }});
+}})();
+</script>
+"""
+        html = html.replace("</body>", interaction_script + "\n</body>")
+        output_path.write_text(html, encoding="utf-8")
 
     console.print(Panel(
         f"[green]Graph exported successfully![/green]\n\n"
         f"Nodes: [bold]{node_count}[/bold]  |  Edges: [bold]{edge_count}[/bold]\n\n"
         f"Open in browser: [bold cyan]{output_path}[/bold cyan]\n\n"
+        f"[bold]Interaction:[/bold] Click root, directory, or file nodes to expand/collapse one level.\n\n"
         f"[dim]Legend: "
         f"[#4fc3f7]● function[/#4fc3f7]  "
         f"[#ff8a65]● class[/#ff8a65]  "

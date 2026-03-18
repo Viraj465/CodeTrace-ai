@@ -31,7 +31,11 @@ def print_banner(console) -> None:
             rich_text.append(char, style=hex_color)
         console.print(rich_text)
 
-    console.print("  [bold dark_orange]Autonomous System Architect v1.0[/bold dark_orange]\n")
+    console.print("  [bold dark_orange]Autonomous System Architect v1.0[/bold dark_orange]")
+    console.print(
+        "  [bold cyan]Help shape Codetrace:[/bold cyan] "
+        "[underline blue]https://github.com/Viraj465/CodeTrace-ai/discussions/5#discussion-9684949[/underline blue]\n"
+    )
 
 
 def show_diff_panel(console, pending: dict) -> bool:
