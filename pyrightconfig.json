@@ -1,0 +1,14 @@
+{
+  "venvPath": ".",
+  "venv": "venv",
+  "pythonVersion": "3.12",
+  "extraPaths": [
+    "./Codetrace-ai",
+    "./Codetrace-ai/src"
+  ],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "venv"
+  ]
+}

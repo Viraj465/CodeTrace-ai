@@ -48,3 +48,5 @@ MANIFEST
 .DS_Store
 *.zip
 idea.md
+benchmarks/
+website-next/

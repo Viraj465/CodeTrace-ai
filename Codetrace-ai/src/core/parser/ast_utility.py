@@ -1,11 +1,11 @@
 """
 These helpers provide language-agnostic traversal over Tree-sitter ASTs
-so we can resolve semantic ownership like:
+to resolve semantic ownership, such as:
 
 Class -> owns -> Method
 Function -> calls -> Function
 
-Works across languages by deriving structure node types from queries/*.scm.
+This works across different languages by deriving structure node types from queries/*.scm.
 """
 
 from functools import lru_cache
@@ -16,7 +16,7 @@ from typing import Iterable, Optional
 
 def node_text(node, source_code: bytes) -> str:
     """
-    Safely extract text of a node from source.
+    Extract the text of a node from the source code.
     """
     return source_code[node.start_byte:node.end_byte].decode("utf-8")
 
@@ -24,7 +24,7 @@ def node_text(node, source_code: bytes) -> str:
 def get_identifier_from_children(node, source_code: bytes) -> Optional[str]:
     """
     Many languages store names as child identifiers.
-    This extracts the first meaningful identifier.
+    This function extracts the first meaningful identifier found.
     """
     identifier_types = {
         "identifier",
@@ -42,7 +42,7 @@ def get_identifier_from_children(node, source_code: bytes) -> Optional[str]:
 
 def find_parent_of_type(node, target_types: Iterable[str]):
     """
-    Walk upward until we find a parent matching one of target_types.
+    Traverse upward until a parent matching one of the target types is found.
     """
     parent = node.parent
 
@@ -56,17 +56,17 @@ def find_parent_of_type(node, target_types: Iterable[str]):
 
 def extract_name_from_definition(node, source_bytes: bytes) -> Optional[str]:
     """
-    Extract identifier name from function/class node.
+    Extract the identifier name from a function or class node.
     """
     for child in node.children:
         if "identifier" in child.type:
-            return node_text(child, source_bytes)  # FIX: removed duplicate _node_text, reuse node_text
+            return node_text(child, source_bytes)  # Use node_text instead of the duplicate function
     return None
 
 
 def climb_to_root(node):
     """
-    Debug helper: climb to root node.
+    Traverse the AST to reach the root node. Useful for debugging.
     """
     while node.parent is not None:
         node = node.parent
@@ -97,7 +97,7 @@ def _extract_node_type_for_capture(query_text: str, capture_index: int) -> Optio
     """
     For a capture like:
         ... ) @function.definition
-    walk backward to find the captured S-expression's root node type.
+    This walks backward to find the captured S-expression's root node type.
     """
     i = capture_index - 1
     while i >= 0 and query_text[i].isspace():
@@ -197,7 +197,8 @@ def _extract_types_from_query_text(query_text: str) -> tuple[set[str], set[str]]
 @lru_cache(maxsize=1)
 def language_structure_map(query_dir: Optional[str] = None) -> dict[str, dict[str, set[str]]]:
     """
-    Build language -> {class: {...}, function: {...}} from queries/*.scm.
+    Build a mapping from language to its class and function node types
+    by reading the queries/*.scm files.
     """
     base_dir = Path(query_dir) if query_dir else QUERY_DIR
     structure: dict[str, dict[str, set[str]]] = {}
@@ -226,8 +227,8 @@ def language_structure_map(query_dir: Optional[str] = None) -> dict[str, dict[st
 
 def get_structure_node_types(language_name: Optional[str] = None) -> tuple[set[str], set[str]]:
     """
-    Return (class_node_types, function_node_types) for one language.
-    If language_name is None, returns union across all query files.
+    Return the class and function node types for a given language.
+    If no language is specified, returns the union of types across all query files.
     """
     structure = language_structure_map()
     if not structure:
@@ -254,7 +255,7 @@ def resolve_enclosing_class(
     class_node_types: Optional[Iterable[str]] = None,
 ) -> Optional[str]:
     """
-    Determine if this function/method lives inside a class/struct.
+    Determine if this function or method is defined inside a class or struct.
     """
     if class_node_types is None:
         class_node_types, _ = get_structure_node_types(language_name)
@@ -268,7 +269,7 @@ def resolve_enclosing_class(
 
 def resolve_function_name(node, source_code: bytes) -> Optional[str]:
     """
-    Extract function/method name regardless of language shape.
+    Extract the function or method name regardless of the specific language syntax.
     """
     return get_identifier_from_children(node, source_code)
 
@@ -280,11 +281,11 @@ def build_qualified_name(
     class_node_types: Optional[Iterable[str]] = None,
 ) -> str:
     """
-    Build:
+    Build a fully qualified name, for example:
         function -> login
         method   -> AuthService.login
     """
-    # FIX: removed corrupted `r`n literal sequences, restored proper line breaks
+    # Handle properly formatted line breaks
     func_name = resolve_function_name(node, source_code)
     if not func_name:
         return "<anonymous>"
@@ -309,7 +310,7 @@ def resolve_enclosing_function(
     class_node_types: Optional[Iterable[str]] = None,
 ) -> Optional[str]:
     """
-    Resolve which function/method a call-site is contained in.
+    Determine which function or method contains a specific call-site.
     """
     if function_node_types is None:
         _, function_node_types = get_structure_node_types(language_name)
@@ -327,7 +328,7 @@ def resolve_enclosing_function(
 
 def debug_path_to_root(node):
     """
-    Return AST type chain - invaluable when adding new languages.
+    Return the AST type chain from the node to the root.
     """
     types = []
     current = node

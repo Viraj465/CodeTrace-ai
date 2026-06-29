@@ -3,11 +3,13 @@ import sqlite3
 import logging
 from pathlib import Path
 from typing import Optional
-from src.core.database.db_utils import get_db_connection
+# Use relative imports so IDEs resolve them correctly within the package.
+from ..database.db_utils import get_db_connection
+from ...ignore import read_gitignore
+import fnmatch
 
 logger = logging.getLogger(__name__)
 
-# Graph builder
 
 class CodeGraph:
 
@@ -30,7 +32,7 @@ class CodeGraph:
     
     def __init__(self, db_dir: Optional[str | Path] = None):
         """
-        Directed graph creation with optional SQLite persistence.
+        Creates a directed graph with optional SQLite persistence.
         If db_dir is provided, it automatically restores the previous state.
         """
         self.direct_graph = nx.DiGraph()
@@ -48,27 +50,36 @@ class CodeGraph:
          # PRAGMAs are now handled by get_db_connection
          conn.commit()
     
-    # creation of nodes
     def add_nodes(self, symbol_id: str, symbol_type: str, file: str):
         """
-        Creation of nodes to the graph
+        Add a node to the graph.
         """
         # Pass as keyword arguments for correct metadata indexing
         self.direct_graph.add_node(symbol_id,
                                    type = symbol_type,
                                    file = file)
-    
+
     def add_edges(self, caller: str, callee: str):
         """
-        Function A (caller) -> Function B (callee)
+        Add an edge indicating that the caller invokes the callee.
         """
         self.direct_graph.add_edge(caller,
                                    callee,
                                    relation = "calls")
+
+    def add_nodes_batch(self, nodes: list[tuple[str, str, str]]):
+        """Add multiple nodes from a list of (symbol_id, symbol_type, file)."""
+        for symbol_id, symbol_type, file in nodes:
+            self.direct_graph.add_node(symbol_id, type=symbol_type, file=file)
+
+    def add_edges_batch(self, edges: list[tuple[str, str]]):
+        """Add multiple edges from a list of (caller_id, callee_id)."""
+        for caller, callee in edges:
+            self.direct_graph.add_edge(caller, callee, relation="calls")
     
     def add_ownership(self, cls: str, method: str):
         """
-        Class own method
+        Add an edge indicating that a class defines a method.
         """
         self.direct_graph.add_edge(cls,
                                    method,
@@ -76,14 +87,14 @@ class CodeGraph:
         
     def persist_to_db(self):
         """
-        1. Graph Serialization:
-        Dumps the entire RAM graph to SQLite. Uses UPSERTs to prevent duplicate errors.
-        Should be called at the end of the CLI `index` command.
+        Serialize the entire RAM graph to SQLite.
+        Uses UPSERTs to prevent duplicate errors.
+        Should be called at the end of the index command.
         """
         if not self.db_path: 
             return
         
-        # Extract data from NetworkX
+        # Extract nodes and edges from NetworkX
         nodes_data = [(n, d.get("type", "unknown"), d.get("file", "unknown")) 
                       for n, d in self.direct_graph.nodes(data=True)]
         
@@ -108,9 +119,7 @@ class CodeGraph:
             
     def load_from_db(self):
         """
-        2. Graph Restoration:
-        Wipes RAM and rebuilds the DiGraph perfectly from SQLite.
-        Essential for instantly booting the CLI `chat` command.
+        Clear the graph in memory and rebuild it from the SQLite database.
         """
         if not self.db_path: 
             return
@@ -126,63 +135,72 @@ class CodeGraph:
         for src, tgt, rel in edges:
             self.direct_graph.add_edge(src, tgt, relation=rel)
 
-    def prune_file(self, filepath: str):
-        """
-        3. Edge & Node Pruning (Delta Cleanup):
-        If a file is modified or deleted, this safely removes its old nodes AND 
-        any edges where it was the caller or the callee.
-        """
-        if not self.db_path: 
+
+
+    def prune_files(self, filepaths: list[str]):
+        """Remove nodes/edges for multiple files, then reload graph once."""
+        if not self.db_path or not filepaths:
             return
         
+        # Chunk the IN clauses to stay under SQLite's variable limit.
+        CHUNK_SIZE = 900
+
+        all_nodes = []
         with get_db_connection(self.db_path) as conn:
-            # 1. Identify all nodes defined in this file
-            nodes = conn.execute("SELECT node_id FROM graph_nodes WHERE file = ?", (filepath,)).fetchall()
-            nodes_to_delete = [row[0] for row in nodes]
+            # Collect node IDs in chunks to avoid exceeding SQL variable limit
+            for i in range(0, len(filepaths), CHUNK_SIZE):
+                chunk = filepaths[i:i + CHUNK_SIZE]
+                placeholders = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"SELECT node_id FROM graph_nodes WHERE file IN ({placeholders})",
+                    chunk
+                ).fetchall()
+                all_nodes.extend(r[0] for r in rows)
             
-            if not nodes_to_delete: 
-                return
-            
-            placeholders = ",".join("?" * len(nodes_to_delete))
-            
-            # 2. Manual Cascade Delete: Remove edges touching these nodes
-            conn.execute(f"""
-                DELETE FROM graph_edges 
-                WHERE source IN ({placeholders}) OR target IN ({placeholders})
-            """, nodes_to_delete * 2)
-            
-            # 3. Delete the nodes themselves
-            conn.execute("DELETE FROM graph_nodes WHERE file = ?", (filepath,))
-            conn.commit()
-            
-        # 4. Sync memory to perfectly match the cleaned DB
+            if all_nodes:
+                # Delete edges in chunks. 
+                # The OR clause doubles the variable count, so halve the chunk size.
+                edge_chunk = CHUNK_SIZE // 2
+                for i in range(0, len(all_nodes), edge_chunk):
+                    chunk = all_nodes[i:i + edge_chunk]
+                    ph = ",".join("?" * len(chunk))
+                    conn.execute(f"""
+                        DELETE FROM graph_edges 
+                        WHERE source IN ({ph}) OR target IN ({ph})
+                    """, chunk * 2)
+
+                # Delete nodes in chunks
+                for i in range(0, len(filepaths), CHUNK_SIZE):
+                    chunk = filepaths[i:i + CHUNK_SIZE]
+                    ph = ",".join("?" * len(chunk))
+                    conn.execute(f"DELETE FROM graph_nodes WHERE file IN ({ph})", chunk)
+
+                conn.commit()
+        
         self.load_from_db()
     
-    # Query utility
     def get_dependencies(self, symbol: str):
         """
-        What does the symbol calls?
+        Return the list of symbols that this symbol calls.
         """
         return list(self.direct_graph.successors(symbol))
 
     def get_callers(self, symbol: str):
         """
-        Who calls this symbol?
+        Return the list of symbols that call this symbol.
         """
         return list(self.direct_graph.predecessors(symbol))
     
     def shortest_path(self, start: str, end: str):
         """
-        Trace execution path
+        Return the shortest execution path between start and end.
         """
         return nx.shortest_path(self.direct_graph, start, end)
 
     def get_all_downstream_dependents(self, symbol: str) -> list[dict]:
         """
-        Find ALL symbols that transitively depend on `symbol`.
-        Uses BFS over reversed edges (who calls this?) to trace the full
-        impact chain.  Returns a list of dicts sorted by depth:
-        [{"symbol": ..., "type": ..., "file": ..., "depth": ...}]
+        Find all symbols that transitively depend on the given symbol.
+        Returns a list of dictionaries sorted by depth.
         """
         if symbol not in self.direct_graph:
             return []
@@ -222,7 +240,32 @@ class CodeGraph:
 
     def export_format(self):
         """
-        return context in json for LLM use.
+        Return the graph context in JSON format.
         """
 
         return nx.node_link_data(self.direct_graph)
+    
+    def _load_gitignore(self, repo_root: Path):
+        """
+        Load the .gitignore file and return a set of raw patterns.
+        """
+        return read_gitignore(str(repo_root))
+    
+    def is_ignored(self, rel_path: str, ignore_spec) -> bool:
+        """
+        Return True if the relative path matches any pattern from the pathspec.
+        """
+        return ignore_spec.match_file(rel_path)
+    
+    def filter_paths(self, paths:list[Path], repo_root:Path)->list[Path]:
+        """
+        Return a list of paths that do not match the .gitignore rules.
+        """
+        ignore_spec = self._load_gitignore(repo_root)
+        kept: list[Path] = []
+        for p in paths:
+            # Compute a POSIX‑style path relative to the repo root
+            rel = p.relative_to(repo_root).as_posix()
+            if not self.is_ignored(rel, ignore_spec):
+                kept.append(p)
+        return kept

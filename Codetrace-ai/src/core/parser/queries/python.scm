@@ -10,5 +10,4 @@
 
 (call
   function: (attribute
-    attribute: (identifier) @call.name)) @call.
-    
+    attribute: (identifier) @call.name)) @call.expression

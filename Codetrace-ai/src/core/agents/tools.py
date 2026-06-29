@@ -1,8 +1,9 @@
 """
-Codetrace Agent Tools: Shared core logic + LangChain tool wrappers.
+Codetrace Agent Tools: Shared core logic + OpenAI-compatible tool schemas.
 
 The _impl functions contain the actual logic and can be called by
-both the LangChain agent (CLI) and the MCP server (IDE integration).
+both the httpx-based agent (CLI) and the MCP server (IDE integration).
+The LangChain @tool decorator has been replaced with plain JSON schemas.
 """
 
 from __future__ import annotations
@@ -12,11 +13,12 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-from langchain_core.tools import tool
+# No LangChain dependency — tool schemas are defined as plain dicts below.
 
-from src.core.graph.builder import CodeGraph
-from src.backend.vector_store import VectorStore
-from src.core.database.sync_manager import SyncManager
+# Use relative imports to ensure IDEs resolve them correctly and avoid missing-import errors.
+from ..graph.builder import CodeGraph
+from ...backend.vector_store import VectorStore
+from ..database.sync_manager import SyncManager
 
 
 
@@ -76,6 +78,15 @@ def read_file_impl(file_path: str, max_lines: int = 200) -> str:
 
     try:
         sync = SyncManager(db_dir=str(db_dir))
+        
+        # Safeguard against path traversal
+        p = Path(file_path)
+        if not p.is_absolute():
+            p = Path.cwd() / file_path
+        root = Path.cwd().resolve()
+        if not str(p.resolve()).startswith(str(root)):
+            return f"Blocked: cannot read outside project root ({root})"
+
         snap = sync.get_file_snapshot(file_path)
     except Exception as e:
         return f"Error reading snapshot DB: {e}"
@@ -111,7 +122,7 @@ def inspect_index_impl(query: str = "", limit: int = 50) -> str:
 
     try:
         sync = SyncManager(db_dir=str(db_dir))
-        # Support both slash styles and light glob-like inputs from users.
+        # Support both slash styles and simple glob-like inputs.
         normalized = (query or "").strip()
         variants = {normalized}
         if normalized:
@@ -192,13 +203,13 @@ def write_file_impl(file_path: str, content: str, project_root: str | None = Non
     if not p.is_absolute():
         p = Path.cwd() / file_path
 
-    # Safety: block writes outside the project root
+    # Block writes outside the project root.
     if project_root:
         root = Path(project_root).resolve()
         if not str(p.resolve()).startswith(str(root)):
             return f"Blocked: cannot write outside project root ({root})"
 
-    # Safety: block binary files
+    # Block binary files.
     blocked_extensions = {".exe", ".dll", ".so", ".pyc", ".pyo", ".class", ".o"}
     if p.suffix.lower() in blocked_extensions:
         return f"Blocked: cannot write binary file ({p.suffix})"
@@ -238,12 +249,12 @@ def propose_write_impl(file_path: str, content: str) -> str:
     if not p.is_absolute():
         p = Path.cwd() / file_path
 
-    # Safety checks (same as write_file_impl)
+    # Perform safety checks.
     blocked_extensions = {".exe", ".dll", ".so", ".pyc", ".pyo", ".class", ".o"}
     if p.suffix.lower() in blocked_extensions:
         return f"Blocked: cannot write binary file ({p.suffix})"
 
-    # Read existing file for diff (empty if new file)
+    # Read the existing file for the diff, or leave empty if it is a new file.
     if p.exists() and p.is_file():
         try:
             old_content = p.read_text(encoding="utf-8", errors="replace")
@@ -252,7 +263,7 @@ def propose_write_impl(file_path: str, content: str) -> str:
     else:
         old_content = ""
 
-    # Generate unified diff
+    # Generate a unified diff.
     old_lines = old_content.splitlines(keepends=True)
     new_lines = content.splitlines(keepends=True)
     diff = list(difflib.unified_diff(
@@ -262,7 +273,7 @@ def propose_write_impl(file_path: str, content: str) -> str:
         lineterm="",
     ))
 
-    # Queue the pending write
+    # Queue the pending write.
     _pending_writes.append({
         "file_path": str(p),
         "content": content,
@@ -270,7 +281,7 @@ def propose_write_impl(file_path: str, content: str) -> str:
         "is_new_file": not p.exists(),
     })
 
-    # Return summary to the agent
+    # Return a summary to the agent.
     if not p.exists():
         return (
             f"Proposed: CREATE new file {p.name} ({len(content)} chars). "
@@ -296,9 +307,16 @@ def git_diff_impl(path: str = ".", target: str = "HEAD") -> str:
     """
     try:
         cmd = ["git", "-C", str(Path(path).resolve()), "diff"]
+        
+        # Block malicious flag injections.
+        if target != "--staged" and target.startswith("-"):
+            return f"Blocked: invalid git diff target '{target}'"
+
         if target == "--staged":
             cmd.append("--staged")
         else:
+            # Prevent Git from interpreting subsequent arguments as flags.
+            cmd.append("--")
             cmd.append(target)
 
         result = subprocess.run(
@@ -314,7 +332,7 @@ def git_diff_impl(path: str = ".", target: str = "HEAD") -> str:
         if not diff:
             return "No changes found."
 
-        # Cap output to avoid flooding the LLM context
+        # Limit output length to prevent context flooding.
         lines = diff.splitlines()
         if len(lines) > 300:
             return "\n".join(lines[:300]) + f"\n\n... (truncated, {len(lines)} total lines)"
@@ -327,68 +345,190 @@ def git_diff_impl(path: str = ".", target: str = "HEAD") -> str:
 
 
 
-# LangChain Tool Factory (thin wrappers for the CLI agent)
+# OpenAI-Compatible Tool Schemas
+# Replace the LangChain decorators with plain JSON schemas compatible with standard chat completion APIs.
 
 
-def create_tools(vector_store: VectorStore, graph: CodeGraph) -> list:
-    """Build LangChain @tool wrappers bound to the given stores."""
+def create_tool_schemas() -> list[dict]:
+    """Build OpenAI-compatible tool schemas for the chat completions API."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "search_codebase",
+                "description": (
+                    "Search the indexed codebase for code symbols semantically related to the query. "
+                    "Use this tool whenever you need to find relevant functions, classes, or code snippets. "
+                    "The query should be a natural language description of what you are looking for. "
+                    "Returns matching code snippets with file paths and symbol names."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Natural language search query."}
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "inspect_index",
+                "description": (
+                    "Inspect index DB coverage and list indexed files. "
+                    "Use this before high-level architecture questions to confirm what files "
+                    "are available in the index. query is optional path/keyword filter."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Optional path or keyword filter."},
+                        "limit": {"type": "integer", "description": "Max files to return (default: 50)."},
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_symbol_relations",
+                "description": (
+                    "Get the structural relationships of a code symbol in the dependency graph. "
+                    "Use this to understand what a symbol calls (dependencies) and what calls it (callers). "
+                    "The symbol_id is typically 'filepath:qualified_name', e.g. "
+                    "'src/backend/vector_store.py:VectorStore.add_symbol'."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "symbol_id": {"type": "string", "description": "Symbol ID in 'filepath:qualified_name' format."}
+                    },
+                    "required": ["symbol_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": (
+                    "Read the full contents of a source file by its path. "
+                    "Use this when you need to see imports, constants, or full context that "
+                    "semantic search only partially returned. "
+                    "Returns indexed file content from the DB snapshot."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "Relative or absolute file path."},
+                        "max_lines": {"type": "integer", "description": "Max lines to return (default: 200)."},
+                    },
+                    "required": ["file_path"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "analyze_impact",
+                "description": (
+                    "Find all downstream dependents of a symbol — everything that would "
+                    "be affected if this symbol changes. "
+                    "Use this for impact analysis, e.g. 'If I change function X, what breaks?'"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "symbol_id": {"type": "string", "description": "Symbol ID in 'filepath:qualified_name' format."}
+                    },
+                    "required": ["symbol_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": (
+                    "Propose a file change for user approval. The change will NOT be applied "
+                    "until the user confirms it. Use this to fix bugs, refactor code, or generate "
+                    "new files. Content should be the COMPLETE file content (not a diff)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "Relative path to the file."},
+                        "content": {"type": "string", "description": "Complete file content to write."},
+                    },
+                    "required": ["file_path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "git_diff",
+                "description": (
+                    "Show git diff for the current project. "
+                    "target can be: 'HEAD' (unstaged), '--staged', 'HEAD~1' (last commit), "
+                    "or a branch name to compare against."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "target": {"type": "string", "description": "Diff target (default: 'HEAD'). Options: 'HEAD' (unstaged), '--staged', 'HEAD~1', or a branch name."},
+                    },
+                    "required": [],
+                },
+            },
+        },
+    ]
 
-    @tool
-    def search_codebase(query: str) -> str:
-        """Search the indexed codebase for code symbols semantically related to the query.
-        Use this tool whenever you need to find relevant functions, classes, or code snippets.
-        The query should be a natural language description of what you are looking for.
-        Returns matching code snippets with file paths and symbol names."""
-        return search_codebase_impl(vector_store, query)
 
-    @tool
-    def get_symbol_relations(symbol_id: str) -> str:
-        """Get the structural relationships of a code symbol in the dependency graph.
-        Use this to understand what a symbol calls (dependencies) and what calls it (callers).
-        The symbol_id is typically in the format 'filepath:qualified_name',
-        for example 'src/backend/vector_store.py:VectorStore.add_symbol'.
-        Returns callers, dependencies, and ownership information."""
-        return get_symbol_relations_impl(graph, symbol_id)
+def create_anthropic_tool_schemas() -> list[dict]:
+    """
+    Convert OpenAI tool schemas to Anthropic format.
+    Anthropic uses 'input_schema' instead of 'parameters' and doesn't wrap
+    in {"type": "function", "function": {...}}.
+    """
+    return [
+        {
+            "name": schema["function"]["name"],
+            "description": schema["function"]["description"],
+            "input_schema": schema["function"]["parameters"],
+        }
+        for schema in create_tool_schemas()
+    ]
 
-    @tool
-    def read_file(file_path: str, max_lines: int = 200) -> str:
-        """Read the full contents of a source file by its path.
-        Use this when you need to see imports, constants, or full context that
-        semantic search only partially returned.
-        The path should be relative or absolute as stored in the index.
-        Returns indexed file content from the DB snapshot (capped for safety)."""
-        return read_file_impl(file_path, max_lines)
 
-    @tool
-    def inspect_index(query: str = "", limit: int = 50) -> str:
-        """Inspect index DB coverage and list indexed files.
-        Use this before high-level architecture questions to confirm what files
-        are available in the index. query is optional path/keyword filter."""
-        return inspect_index_impl(query, limit)
+def dispatch_tool(
+    tool_name: str,
+    tool_args: dict,
+    vector_store: VectorStore,
+    graph: CodeGraph,
+) -> str:
+    """
+    Execute a tool by name with the given arguments.
+    Routes to the corresponding _impl function and returns its string output.
+    This replaces the old LangChain @tool closures — same logic, no framework.
+    """
+    dispatchers = {
+        "search_codebase":      lambda: search_codebase_impl(vector_store, tool_args["query"]),
+        "get_symbol_relations": lambda: get_symbol_relations_impl(graph, tool_args["symbol_id"]),
+        "read_file":            lambda: read_file_impl(tool_args["file_path"], tool_args.get("max_lines", 200)),
+        "inspect_index":        lambda: inspect_index_impl(tool_args.get("query", ""), tool_args.get("limit", 50)),
+        "analyze_impact":       lambda: analyze_impact_impl(graph, tool_args["symbol_id"]),
+        "write_file":           lambda: propose_write_impl(tool_args["file_path"], tool_args["content"]),
+        "git_diff":             lambda: git_diff_impl(".", tool_args.get("target", "HEAD")),
+    }
 
-    @tool
-    def analyze_impact(symbol_id: str) -> str:
-        """Find all downstream dependents of a symbol — everything that would
-        be affected if this symbol changes.
-        Use this for impact analysis, e.g. 'If I change function X, what breaks?'
-        The symbol_id format is 'filepath:qualified_name'.
-        Returns a list of affected symbols grouped by depth of dependency."""
-        return analyze_impact_impl(graph, symbol_id)
+    dispatcher = dispatchers.get(tool_name)
+    if dispatcher is None:
+        return f"Unknown tool: {tool_name}"
 
-    @tool
-    def write_file(file_path: str, content: str) -> str:
-        """Propose a file change for user approval. The change will NOT be applied
-        until the user confirms it. Use this to fix bugs, refactor code, or generate
-        new files. The file_path should be relative to the project root.
-        The content should be the COMPLETE file content (not a diff)."""
-        return propose_write_impl(file_path, content)
-
-    @tool
-    def git_diff(target: str = "HEAD") -> str:
-        """Show git diff for the current project.
-        Use this to review recent changes, understand what was modified, or do PR reviews.
-        target can be: 'HEAD' (unstaged), '--staged' (staged), 'HEAD~1' (last commit),
-        or a branch name to compare against."""
-        return git_diff_impl(".", target)
-
-    return [search_codebase, inspect_index, get_symbol_relations, read_file, analyze_impact, write_file, git_diff]
+    try:
+        return dispatcher()
+    except Exception as e:
+        return f"Tool '{tool_name}' failed: {e}"

@@ -5,9 +5,16 @@
 (function_declaration
   name: (identifier) @function.name) @function.definition
 
+(generator_function_declaration
+  name: (identifier) @function.name) @function.definition
+
 (variable_declarator
   name: (identifier) @function.name
   value: (arrow_function)) @function.arrow
+
+(variable_declarator
+  name: (identifier) @function.name
+  value: (function_expression)) @function.expression
 
 (method_definition
   name: (property_identifier) @function.name) @function.method
@@ -18,18 +25,34 @@
 ;; ------------------------
 
 (class_declaration
-  name: (identifier) @class.name) @class.definition
-
-(class
-  name: (identifier) @class.name) @class.expression
+  name: (type_identifier) @class.name) @class.definition
 
 
-;; --- Call Sites ---
+;; ------------------------
+;; TypeScript Type Shapes
+;; ------------------------
 
-; Standard function call
+(interface_declaration
+  name: (type_identifier) @interface.name) @interface.definition
+
+(type_alias_declaration
+  name: (type_identifier) @type.name) @type.definition
+
+(enum_declaration
+  name: (identifier) @enum.name) @enum.definition
+
+
+;; ------------------------
+;; Call Sites
+;; ------------------------
+
 (call_expression
   function: (identifier) @function.call)
-; Method call (e.g., console.log)
+
 (call_expression
   function: (member_expression
     property: (property_identifier) @function.method.call))
+
+(call_expression
+  function: (member_expression
+    property: (private_property_identifier) @function.method.call))

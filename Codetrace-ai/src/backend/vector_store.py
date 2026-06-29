@@ -18,13 +18,41 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
+# Raw chromadb — no LangChain wrapper needed.
+# chromadb.PersistentClient() is the replacement for langchain_chroma.Chroma().
+import chromadb
+from chromadb import Collection
+from flashrank import Ranker, RerankRequest
+
+# Raw sentence-transformers.
+# SentenceTransformer.encode() returns numpy arrays compatible with ChromaDB directly.
+from sentence_transformers import SentenceTransformer
+
+# ── System / device detection ──────────────────────────────────────────────
+from src.core.system_info import get_system_info as _get_system_info
+_SYS = _get_system_info()          # cached, thread-safe
+_DEVICE = _SYS.device              # "cuda" | "mps" | "cpu"
+# ─────────────────────────────────────────────────────────────────────────────
 
 logger = logging.getLogger(__name__)
+
+
+# Lightweight Document dataclass.
+# Replaces langchain_core.documents.Document.
+# Same two fields (page_content, metadata) so downstream code is unchanged.
+
+@dataclass
+class Document:
+    """
+    Minimal document container (replaces langchain_core.documents.Document).
+    page_content: the text of the code symbol.
+    metadata: dict with file path, symbol type, etc.
+    """
+    page_content: str
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass
 class VectorStoreConfig:
@@ -35,18 +63,19 @@ class VectorStoreConfig:
     persist_dir:      str = ".codetrace/chroma"
 
     # Use 'small' variants for 5x speed + 5x less RAM; 'large' for max accuracy.
-    retrieval_align:  str = "BAAI/bge-small-en-v1.5"      # BGE — ranker/retrieval
-    query_condition:  str = "intfloat/e5-small-v2"         # E5  — query understanding
+    retrieval_align:  str = "BAAI/bge-small-en-v1.5"      # BGE ranker/retrieval
+    query_condition:  str = "intfloat/e5-small-v2"         # E5 query understanding
 
     collection_bge:   str = "code_bge"
     collection_e5:    str = "code_e5"
 
-    retrieval_k:      int = 20     # wide initial retrieval (candidates for re-ranker)
-    top_k:            int = 5      # final results after re-ranking
-    rrf_k:            int = 60     # RRF constant; higher = smoother rank blending
-    embed_batch_size: int = 32     # sent to HuggingFace encode
+    retrieval_k:      int = 20     # Wide initial retrieval.
+    top_k:            int = 5      # Final results after re-ranking.
+    rrf_k:            int = 60     # RRF constant; higher = smoother rank blending.
+    embed_batch_size: int = _SYS.embed_batch_size
+    # Batch size is driven by system_info: 128 (CUDA) | 64 (MPS) | 32 (CPU).
 
-    # Re-ranker (FlashRank cross-encoder, runs locally)
+    # Re-ranker (FlashRank cross-encoder, runs locally).
     reranker_model:   str = "ms-marco-MiniLM-L-12-v2"
 
 
@@ -63,74 +92,94 @@ class VectorStore:
 
     def __init__(self, config: VectorStoreConfig | None = None) -> None:
         self.config = config or VectorStoreConfig()
-        self._bge_embeddings: HuggingFaceEmbeddings | None = None
-        self._e5_embeddings:  HuggingFaceEmbeddings | None = None
-        self._bge_store: Chroma | None = None
-        self._e5_store:  Chroma | None = None
-        self._reranker = None          # lazy-loaded on first search
+        self._bge_model: Optional[SentenceTransformer] = None
+        self._e5_model:  Optional[SentenceTransformer] = None
+        self._chroma_client: Optional[chromadb.PersistentClient] = None
+        self._bge_col: Optional[Collection] = None
+        self._e5_col:  Optional[Collection] = None
+        self._reranker = None          # Lazy-loaded on first search.
         self._init_stores()
 
-    
-    # Lazy properties — models are only loaded when first accessed
-    
+    # Lazy model properties
+    # Models are only loaded when first accessed, then cached.
 
     @property
-    def bge_embeddings(self) -> HuggingFaceEmbeddings:
-        if self._bge_embeddings is None:
-            logger.info("Loading BGE embedding model: %s", self.config.retrieval_align)
-            self._bge_embeddings = HuggingFaceEmbeddings(
-                model_name=self.config.retrieval_align,
-                encode_kwargs={
-                    "batch_size": self.config.embed_batch_size,
-                    "normalize_embeddings": True,   # required for cosine similarity
-                },
-            )
-        return self._bge_embeddings
+    def bge_model(self) -> SentenceTransformer:
+        if self._bge_model is None:
+            logger.info("Loading BGE embedding model: %s (device=%s)", self.config.retrieval_align, _DEVICE.upper())
+            self._bge_model = SentenceTransformer(self.config.retrieval_align, device=_DEVICE)
+        return self._bge_model
 
     @property
-    def e5_embeddings(self) -> HuggingFaceEmbeddings:
-        if self._e5_embeddings is None:
-            logger.info("Loading E5 embedding model: %s", self.config.query_condition)
-            self._e5_embeddings = HuggingFaceEmbeddings(
-                model_name=self.config.query_condition,
-                encode_kwargs={
-                    "batch_size": self.config.embed_batch_size,
-                    "normalize_embeddings": True,
-                },
-            )
-        return self._e5_embeddings
+    def e5_model(self) -> SentenceTransformer:
+        if self._e5_model is None:
+            logger.info("Loading E5 embedding model: %s (device=%s)", self.config.query_condition, _DEVICE.upper())
+            self._e5_model = SentenceTransformer(self.config.query_condition, device=_DEVICE)
+        return self._e5_model
 
-    
+    # Internal helpers
+
+    def _embed_bge(self, texts: List[str]) -> List[List[float]]:
+        """Embed texts with BGE model, normalised for cosine similarity."""
+        vectors = self.bge_model.encode(
+            texts,
+            batch_size=self.config.embed_batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return vectors.tolist()
+
+    def _embed_e5(self, texts: List[str]) -> List[List[float]]:
+        """
+        Embed texts with E5 model.
+        E5 expects a 'passage: ' prefix for document indexing,
+        and 'query: ' prefix for query embedding.
+        """
+        prefixed = [f"passage: {t}" for t in texts]
+        vectors = self.e5_model.encode(
+            prefixed,
+            batch_size=self.config.embed_batch_size,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return vectors.tolist()
+
+    def _embed_e5_query(self, query: str) -> List[float]:
+        """Embed a search query with E5's 'query: ' prefix."""
+        vectors = self.e5_model.encode(
+            [f"query: {query}"],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        return vectors[0].tolist()
+
     # Initialization
-    
 
     def _init_stores(self) -> None:
         """
-        Load both models in parallel, then open Chroma collections.
+        Load both models in parallel, then open ChromaDB collections.
         Parallelising model loading cuts cold-start time ~50%.
         """
         with ThreadPoolExecutor(max_workers=2) as ex:
-            bge_fut = ex.submit(lambda: self.bge_embeddings)
-            e5_fut  = ex.submit(lambda: self.e5_embeddings)
-            # force resolution so errors surface here, not later
+            bge_fut = ex.submit(lambda: self.bge_model)
+            e5_fut  = ex.submit(lambda: self.e5_model)
             bge_fut.result()
             e5_fut.result()
 
-        self._bge_store = Chroma(
-            collection_name=self.config.collection_bge,
-            persist_directory=self.config.persist_dir,
-            embedding_function=self.bge_embeddings,
+        # Open ChromaDB with a single persistent client shared by both collections.
+        # chromadb.PersistentClient() replaces the old langchain_chroma.Chroma() wrapper.
+        self._chroma_client = chromadb.PersistentClient(path=self.config.persist_dir)
+        self._bge_col = self._chroma_client.get_or_create_collection(
+            name=self.config.collection_bge,
+            metadata={"hnsw:space": "cosine"},   # Required for normalized BGE vectors.
         )
-        self._e5_store = Chroma(
-            collection_name=self.config.collection_e5,
-            persist_directory=self.config.persist_dir,
-            embedding_function=self.e5_embeddings,
+        self._e5_col = self._chroma_client.get_or_create_collection(
+            name=self.config.collection_e5,
+            metadata={"hnsw:space": "cosine"},
         )
         logger.info("Chroma collections ready (dir=%s)", self.config.persist_dir)
 
-    
-    # Indexing — single symbol
-    
+    # Indexing - single symbol
 
     def add_symbol(self, symbol_id: str, content: str, metadata: Dict[str, Any]) -> None:
         """
@@ -140,35 +189,42 @@ class VectorStore:
         If either store fails, we attempt to roll back the successful one
         so both collections stay in sync.
         """
+        # Sanitize metadata: ChromaDB only accepts str/int/float/bool values.
+        clean_meta = {
+            k: v for k, v in metadata.items()
+            if isinstance(v, (str, int, float, bool))
+        }
+
         bge_written = False
         try:
-            self._bge_store.add_texts(
+            bge_vec = self._embed_bge([content])
+            self._bge_col.upsert(
                 ids=[symbol_id],
-                texts=[content],
-                metadatas=[metadata],
+                documents=[content],
+                embeddings=bge_vec,
+                metadatas=[clean_meta],
             )
             bge_written = True
 
-            self._e5_store.add_texts(
+            e5_vec = self._embed_e5([content])
+            self._e5_col.upsert(
                 ids=[symbol_id],
-                texts=[content],
-                metadatas=[metadata],
+                documents=[content],
+                embeddings=e5_vec,
+                metadatas=[clean_meta],
             )
 
         except Exception as exc:
             logger.error("add_symbol failed for id=%s: %s", symbol_id, exc)
             if bge_written:
-                # rollback BGE so stores don't drift apart
                 try:
-                    self._bge_store.delete(ids=[symbol_id])
+                    self._bge_col.delete(ids=[symbol_id])
                     logger.warning("Rolled back BGE write for id=%s", symbol_id)
                 except Exception as rb_exc:
                     logger.error("Rollback also failed for id=%s: %s", symbol_id, rb_exc)
             raise RuntimeError(f"VectorStore sync failure on symbol '{symbol_id}'") from exc
 
-    
-    # Indexing — batch (much faster than looping add_symbol)
-    
+    # Indexing - batch
 
     def add_symbols_batch(
         self,
@@ -188,10 +244,10 @@ class VectorStore:
         # ChromaDB requires unique IDs per batch. Deduplicate, keeping last occurrence.
         seen: dict[str, int] = {}
         for idx, sid in enumerate(symbol_ids):
-            seen[sid] = idx                       # last-write wins
+            seen[sid] = idx                       # Last-write wins.
         if len(seen) < len(symbol_ids):
             original_len = len(symbol_ids)
-            unique_idx   = sorted(seen.values())  # preserve original order
+            unique_idx   = sorted(seen.values())  # Preserve original order.
             symbol_ids   = [symbol_ids[i]  for i in unique_idx]
             contents     = [contents[i]    for i in unique_idx]
             metadatas    = [metadatas[i]   for i in unique_idx]
@@ -199,35 +255,64 @@ class VectorStore:
                 "Deduplicated batch: %d → %d unique IDs.", original_len, len(seen)
             )
 
-        bge_written = False
-        try:
-            self._bge_store.add_texts(
-                ids=symbol_ids,
-                texts=contents,
-                metadatas=metadatas,
-            )
-            bge_written = True
+        # Sanitize metadata for ChromaDB.
+        clean_metas = [
+            {k: v for k, v in m.items() if isinstance(v, (str, int, float, bool))}
+            for m in metadatas
+        ]
 
-            self._e5_store.add_texts(
-                ids=symbol_ids,
-                texts=contents,
-                metadatas=metadatas,
-            )
-            logger.info("Batch upserted %d symbols.", len(symbol_ids))
+        # ChromaDB has a hard max upsert batch size (~5461 records).
+        # Embed the full list at once (maximises GPU throughput) then write
+        # to ChromaDB in safe chunks.
+        CHROMA_MAX_BATCH = 5000  # conservative — well under the 5461 hard limit
+
+        bge_written_ids: List[str] = []
+        try:
+            # Embed everything in one shot (GPU-efficient).
+            bge_vecs = self._embed_bge(contents)
+            e5_vecs  = self._embed_e5(contents)
+
+            # Write to ChromaDB in chunks.
+            for start in range(0, len(symbol_ids), CHROMA_MAX_BATCH):
+                end      = start + CHROMA_MAX_BATCH
+                chunk_ids    = symbol_ids[start:end]
+                chunk_docs   = contents[start:end]
+                chunk_metas  = clean_metas[start:end]
+                chunk_bge    = bge_vecs[start:end]
+                chunk_e5     = e5_vecs[start:end]
+
+                self._bge_col.upsert(
+                    ids=chunk_ids,
+                    documents=chunk_docs,
+                    embeddings=chunk_bge,
+                    metadatas=chunk_metas,
+                )
+                bge_written_ids.extend(chunk_ids)
+
+                self._e5_col.upsert(
+                    ids=chunk_ids,
+                    documents=chunk_docs,
+                    embeddings=chunk_e5,
+                    metadatas=chunk_metas,
+                )
+
+            logger.info("Batch upserted %d symbols (%d chunks).",
+                        len(symbol_ids),
+                        (len(symbol_ids) + CHROMA_MAX_BATCH - 1) // CHROMA_MAX_BATCH)
 
         except Exception as exc:
             logger.error("add_symbols_batch failed: %s", exc)
-            if bge_written:
+            if bge_written_ids:
                 try:
-                    self._bge_store.delete(ids=symbol_ids)
-                    logger.warning("Rolled back BGE batch write (%d ids).", len(symbol_ids))
+                    # Roll back only the chunks already committed to BGE.
+                    for start in range(0, len(bge_written_ids), CHROMA_MAX_BATCH):
+                        self._bge_col.delete(ids=bge_written_ids[start:start + CHROMA_MAX_BATCH])
+                    logger.warning("Rolled back BGE batch write (%d ids).", len(bge_written_ids))
                 except Exception as rb_exc:
                     logger.error("Batch rollback failed: %s", rb_exc)
             raise RuntimeError("VectorStore batch sync failure") from exc
 
-    
     # Hybrid Search
-    
 
     def hybrid_search(self, query: str) -> List[Document]:
         """
@@ -240,14 +325,28 @@ class VectorStore:
                     → top_k results
         """
         retrieval_k = self.config.retrieval_k
+        bge_query_vec = self._embed_bge([query])[0]
+        e5_query_vec  = self._embed_e5_query(query)
+
+        def _search_bge():
+            results = self._bge_col.query(
+                query_embeddings=[bge_query_vec],
+                n_results=retrieval_k,
+                include=["documents", "metadatas", "distances"],
+            )
+            return self._chroma_results_to_docs(results)
+
+        def _search_e5():
+            results = self._e5_col.query(
+                query_embeddings=[e5_query_vec],
+                n_results=retrieval_k,
+                include=["documents", "metadatas", "distances"],
+            )
+            return self._chroma_results_to_docs(results)
 
         with ThreadPoolExecutor(max_workers=2) as ex:
-            bge_fut = ex.submit(
-                self._bge_store.similarity_search, query, k=retrieval_k
-            )
-            e5_fut = ex.submit(
-                self._e5_store.similarity_search, query, k=retrieval_k
-            )
+            bge_fut = ex.submit(_search_bge)
+            e5_fut  = ex.submit(_search_e5)
 
             results: Dict[str, List[Document]] = {}
             for fut in as_completed([bge_fut, e5_fut]):
@@ -260,7 +359,7 @@ class VectorStore:
                     results.setdefault("bge", [])
                     results.setdefault("e5",  [])
 
-        # Stage 1: RRF merge (broad candidate list)
+        # Stage 1: RRF merge (broad candidate list).
         rrf_results = self._rrf_merge(
             results.get("bge", []),
             results.get("e5",  []),
@@ -269,12 +368,20 @@ class VectorStore:
         if not rrf_results:
             return []
 
-        # Stage 2: FlashRank cross-encoder re-ranking (precision filtering)
+        # Stage 2: FlashRank cross-encoder re-ranking (precision filtering).
         return self._rerank(query, rrf_results)
 
-    
+    def _chroma_results_to_docs(self, results: dict) -> List[Document]:
+        """Convert a raw chromadb query result dict to a list of Documents."""
+        docs = []
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        for text, meta in zip(documents, metadatas):
+            if text:
+                docs.append(Document(page_content=text, metadata=meta or {}))
+        return docs
+
     # RRF Merge
-    
 
     def _rrf_merge(
         self,
@@ -296,7 +403,7 @@ class VectorStore:
 
         for rank, doc in enumerate(bge_results):
             key = doc.page_content
-            scores[key]  += 1.5 / (rrf_k + rank + 1)   # BGE weighted higher
+            scores[key]  += 1.5 / (rrf_k + rank + 1)   # BGE weighted higher.
             doc_map[key]  = doc
 
         for rank, doc in enumerate(e5_results):
@@ -307,9 +414,7 @@ class VectorStore:
         ranked_keys = sorted(scores, key=scores.__getitem__, reverse=True)
         return [doc_map[key] for key in ranked_keys]
 
-    
     # FlashRank Re-ranker
-    
 
     def _rerank(self, query: str, documents: List[Document]) -> List[Document]:
         """
@@ -322,35 +427,20 @@ class VectorStore:
         if not documents:
             return []
 
-        # Lazy-load the re-ranker on first call
+        # Lazy-load the re-ranker on first call.
         if self._reranker is None:
-            from flashrank import Ranker
+            
             logger.info("Loading FlashRank re-ranker: %s", self.config.reranker_model)
             self._reranker = Ranker(model_name=self.config.reranker_model)
 
-        from flashrank import RerankRequest
-
-        # Build passages for FlashRank (expects list of dicts with "text" key)
-        passages = []
-        for doc in documents:
-            passages.append({
-                "text": doc.page_content,
-                "meta": doc.metadata,
-            })
-
+        passages = [{"text": doc.page_content, "meta": doc.metadata} for doc in documents]
         rerank_request = RerankRequest(query=query, passages=passages)
         ranked = self._reranker.rerank(rerank_request)
 
-        # Map back to LangChain Documents, sorted by FlashRank score (descending)
         reranked_docs = []
         for result in ranked[:self.config.top_k]:
             meta = result.get("meta", result.get("metadata", {}))
-            reranked_docs.append(
-                Document(
-                    page_content=result["text"],
-                    metadata=meta,
-                )
-            )
+            reranked_docs.append(Document(page_content=result["text"], metadata=meta))
 
         logger.info(
             "Re-ranked %d candidates → top %d results.",
@@ -358,31 +448,27 @@ class VectorStore:
         )
         return reranked_docs
 
-    
     # Deletion
-    
 
     def delete_symbol(self, symbol_id: str) -> None:
         """Remove a symbol from both stores."""
         errors = []
-        for store, name in [(self._bge_store, "BGE"), (self._e5_store, "E5")]:
+        for col, name in [(self._bge_col, "BGE"), (self._e5_col, "E5")]:
             try:
-                store.delete(ids=[symbol_id])
+                col.delete(ids=[symbol_id])
             except Exception as exc:
                 logger.error("Delete from %s failed for id=%s: %s", name, symbol_id, exc)
                 errors.append(exc)
         if errors:
             raise RuntimeError(f"delete_symbol incomplete for '{symbol_id}'") from errors[0]
 
-    
-    # Info / Debug
-    
+    # Info and Debug
 
     def collection_counts(self) -> Dict[str, int]:
         """Return number of indexed documents in each collection."""
         return {
-            "bge": self._bge_store._collection.count(),
-            "e5":  self._e5_store._collection.count(),
+            "bge": self._bge_col.count(),
+            "e5":  self._e5_col.count(),
         }
 
     def __repr__(self) -> str:
