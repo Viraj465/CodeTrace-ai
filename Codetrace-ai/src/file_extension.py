@@ -14,9 +14,18 @@ EXTENSIONS_MAP = {
     ".go": "go",
     ".rs": "rust",
     ".php": "php",
+    # Dart is currently not supported
     # ".dart": "dart",
     ".html": "html",
     ".htm": "html",
     ".json": "json",
     ".css": "css",
+    # New languages
+    ".cs": "c_sharp",
+    ".swift": "swift",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".sh": "bash",
+    ".bash": "bash",
+    ".zsh": "bash",
 }

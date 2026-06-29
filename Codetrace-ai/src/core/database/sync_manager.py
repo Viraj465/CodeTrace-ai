@@ -1,4 +1,4 @@
-﻿"""
+"""
 SyncManager: Handles delta updates using SQLite to prevent redundant parsing and embedding.
 Tracks file hashes and modification timestamps to identify changes.
 """
@@ -9,7 +9,9 @@ import logging
 from pathlib import Path
 from typing import Optional, List, Any
 
-from src.core.database.db_utils import get_db_connection
+# Use relative imports so IDEs resolve them correctly within the package.
+from .db_utils import get_db_connection
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -279,33 +281,48 @@ class SyncManager:
         self.set_metadata("tracked_snapshot_count", len(file_hash_pairs))
         self.set_metadata("manifest_hash", manifest_hash)
 
-    def get_changed_files(self, filepaths: List[str]) -> List[tuple[str, str]]:
-        """
-        Check many files in ONE db query.
-        Returns list of (filepath, hash) for files that are new or modified.
-        """
+    def get_changed_files_parallel(self, filepaths: list[str], max_workers: int = 8) -> list[tuple[str, str]]:
+        """Same as get_changed_files but hashes files in parallel."""
         if not filepaths:
             return []
-
-        placeholders = ",".join("?" * len(filepaths))
+        
+        db_hashes = {}
+        chunk_size = 900
         with get_db_connection(self.db_path) as conn:
-            rows = conn.execute(
-                f"SELECT filepath, filehash FROM file_hashes WHERE filepath IN ({placeholders})",
-                [str(p) for p in filepaths]
-            ).fetchall()
-
-        db_hashes = {r[0]: r[1] for r in rows}
+            for i in range(0, len(filepaths), chunk_size):
+                chunk = filepaths[i:i + chunk_size]
+                placeholders = ",".join("?" * len(chunk))
+                rows = conn.execute(
+                    f"SELECT filepath, filehash FROM file_hashes WHERE filepath IN ({placeholders})",
+                    [str(p) for p in chunk]
+                ).fetchall()
+                for r in rows:
+                    db_hashes[r[0]] = r[1]
+        
+        def _hash_one(fp: str) -> tuple[str, str] | None:
+            h = self._compute_file_hash(fp)
+            if h and h != db_hashes.get(str(fp)):
+                return (str(fp), h)
+            return None
+        
         changed = []
-        for fp in filepaths:
-            current_hash = self._compute_file_hash(fp)
-            if current_hash and current_hash != db_hashes.get(str(fp)):
-                changed.append((str(fp), current_hash))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            for result in ex.map(_hash_one, filepaths):
+                if result:
+                    changed.append(result)
         return changed
+
+    def get_changed_files(self, filepaths: List[str]) -> List[tuple[str, str]]:
+        """
+        Check multiple files via database queries.
+        Returns a list of (filepath, hash) for files that are new or modified.
+        """
+        return self.get_changed_files_parallel(filepaths)
 
     def mark_files_synced_batch(self, file_hash_pairs: List[tuple[str, str]]) -> None:
         """
-        Upsert many records in a SINGLE transaction - 10x faster than looping.
-        file_hash_pairs: list of (filepath, hash)
+        Upsert multiple records in a single transaction for improved performance.
+        `file_hash_pairs` is a list of (filepath, hash).
         """
         if not file_hash_pairs:
             return

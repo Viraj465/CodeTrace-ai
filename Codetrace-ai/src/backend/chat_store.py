@@ -113,7 +113,7 @@ class ChatStore:
             "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
             (session_id, role, content),
         )
-        # Update session timestamp and auto-title from first user message
+        # Update session timestamp and auto-title from the first user message.
         self.conn.execute(
             "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?",
             (session_id,),
@@ -123,7 +123,7 @@ class ChatStore:
     def get_messages(self, session_id: str, limit: int | None = None) -> list[dict]:
         """Get messages for a session, optionally limited to the last N."""
         if limit:
-            # Get the last `limit` messages (in chronological order)
+            # Get the last limit messages in chronological order.
             rows = self.conn.execute("""
                 SELECT role, content FROM (
                     SELECT role, content, id FROM messages
@@ -141,17 +141,17 @@ class ChatStore:
         return [{"role": r["role"], "content": r["content"]} for r in rows]
 
     def get_history_for_llm(self, session_id: str, max_turns: int = 5) -> list[tuple[str, str]]:
-        """Get chat history formatted for LangChain's MessagesPlaceholder.
+        """Get chat history formatted as (role, content) tuples for the agent.
 
-        Returns a list of (role, content) tuples for the last `max_turns`
-        exchanges (each exchange = 1 user msg + 1 assistant msg = 2 messages).
+        Returns a list of (role, content) tuples for the last max_turns exchanges
+        (each exchange equals 1 user message plus 1 assistant message).
         """
         messages = self.get_messages(session_id, limit=max_turns * 2)
         return [(m["role"], m["content"]) for m in messages]
 
     
     # Search & Export
-    
+
 
     def search(self, query: str, limit: int = 10) -> list[dict]:
         """Search across all sessions for messages matching the query."""

@@ -5,8 +5,33 @@ import json
 import logging
 import os
 import shutil
+import sys
 import time
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Windows: Force UTF-8 so Rich Unicode renders correctly in PowerShell or Windows Terminal.
+# Two layers are required:
+#   1. SetConsoleOutputCP(65001) sets the Win32 console code page to UTF-8.
+#   2. sys.stdout.reconfigure() makes Python's stream write UTF-8 bytes.
+if sys.platform == "win32":
+    # Layer 1: Set Win32 console code page to UTF-8
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        ctypes.windll.kernel32.SetConsoleCP(65001)
+    except Exception:
+        pass
+    # Layer 2: Reconfigure Python streams
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass  # Fallback for Python versions below 3.7.
+    # Layer 3: Disable Rich's LegacyWindowsTerm renderer.
+    # Rich defaults to using _win32_console.py on older Windows consoles, which
+    # bypasses the UTF-8 fixes. Setting RICH_LEGACY_WINDOWS=0 forces the standard ANSI path.
+    os.environ.setdefault("RICH_LEGACY_WINDOWS", "0")
 
 import typer
 from dotenv import load_dotenv
@@ -14,8 +39,36 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
+import colorsys
+from rich.progress import Progress, SpinnerColumn, TextColumn, ProgressColumn, Task
+from rich.text import Text
 from rich.prompt import Prompt
+
+class GradientBarColumn(ProgressColumn):
+    """A sleek progress bar that transitions from yellow to orange."""
+    def __init__(self, bar_width: int = 40):
+        self.bar_width = bar_width
+        super().__init__()
+
+    def render(self, task: "Task") -> Text:
+        total = task.total if task.total is not None else 100
+        progress = task.completed / total if total > 0 else 0
+
+        # Yellow to Orange (hue from ~0.15 to ~0.05)
+        hue = 0.15 - (progress * 0.10)
+        r, g, b = colorsys.hsv_to_rgb(max(0.0, hue), 0.9, 1.0)
+        hex_color = f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+
+        filled = int(self.bar_width * progress)
+        empty = self.bar_width - filled
+
+        return Text.assemble(
+            ("[", "dim"),
+            ("\u2500" * filled, f"bold {hex_color}"),
+            ("\u2500" * empty, "dim white"),
+            ("]", "dim"),
+            (f" {int(progress * 100)}%", f"bold {hex_color}")
+        )
 
 from src.backend.chat_store import ChatStore
 from src.backend.vector_store import VectorStore, VectorStoreConfig
@@ -47,8 +100,12 @@ from src.core.agents.tools import (
 from src.core.database.sync_manager import SyncManager
 from src.core.graph.builder import CodeGraph
 from src.core.graph.orchestrator import GraphOrchestrator
+from src.core.system_info import get_system_info
+from src.ignore import ALWAYS_IGNORE_DIRS, _is_always_ignored
 
-# Silence HuggingFace / Transformers verbose weight-loading spam.
+logger = logging.getLogger(__name__)
+
+# Silence verbose weight-loading logs from HuggingFace and Transformers.
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -56,6 +113,12 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+
+# Silence httpx HTTP request logs and FlashRank progress bars.
+logging.getLogger("httpx").setLevel(logging.ERROR)
+logging.getLogger("httpcore").setLevel(logging.ERROR)
+logging.getLogger("flashrank").setLevel(logging.ERROR)
+logging.getLogger("src.backend.vector_store").setLevel(logging.WARNING)
 
 load_dotenv()
 
@@ -69,11 +132,33 @@ app = typer.Typer(
     add_completion=False,
 )
 
-console = Console()
+# Set legacy_windows=False to prevent Rich from using the Win32 LegacyWindowsTerm renderer, which causes Unicode garbling.
+console = Console(legacy_windows=False)
 
 
 def print_banner() -> None:
     _print_banner(console)
+
+
+def print_system_info() -> None:
+    """Print a compact system environment panel after the banner."""
+    sys_info = get_system_info()
+    device_color = {"cuda": "green", "mps": "green", "cpu": "yellow"}.get(sys_info.device, "white")
+    lines = [
+        f"  [bold]OS[/bold]       [cyan]{sys_info.os_name}[/cyan]  [dim]{sys_info.os_version}  {sys_info.arch}[/dim]",
+        f"  [bold]Compute[/bold]  [{device_color}]{sys_info.embed_device_label}[/{device_color}]"
+        + (f"  [dim]{sys_info.gpu_name}[/dim]" if sys_info.gpu_name else ""),
+        f"  [bold]RAM[/bold]      {sys_info.ram_available_gb:.1f} GB free / {sys_info.ram_total_gb:.1f} GB total  "
+        f"[dim]· {sys_info.cpu_cores} CPU cores[/dim]",
+    ]
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title="[bold dim]System Environment[/bold dim]",
+            border_style="dim",
+            padding=(0, 1),
+        )
+    )
 
 
 def get_project_root(path: str) -> Path:
@@ -87,6 +172,24 @@ def ensure_config() -> None:
 def _run_setup_wizard(config_path: Path, is_reconfigure: bool = False) -> None:
     _run_setup_wizard_impl(config_path, console, is_reconfigure=is_reconfigure)
 
+def collect_source_files(root: Path) -> list[Path]:
+    """
+    Walk through the directory and collect all source code files,
+    while respecting .gitignore rules AND the hardcoded ALWAYS_IGNORE_DIRS.
+
+    Uses os.walk with in-place directory pruning so we never descend into
+    node_modules/, venv/, __pycache__/, etc. \u2014 avoiding enumerating 20k+ files.
+    """
+    all_files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune always-ignored dirs IN-PLACE so os.walk never enters them.
+        dirnames[:] = [d for d in dirnames if not _is_always_ignored(d)]
+        for filename in filenames:
+            all_files.append(Path(dirpath) / filename)
+
+    graph = CodeGraph()
+    filtered_files = graph.filter_paths(all_files, repo_root=root)
+    return filtered_files
 
 @app.command()
 def chat(
@@ -101,10 +204,10 @@ def chat(
         enable_offline_mode()
 
     print_banner()
-    
+    print_system_info()
     target_dir = get_project_root(".")
     db_dir = target_dir / ".codetrace"
-    
+
     if not db_dir.exists():
         console.print("[red]Error: Repository not indexed. Run 'codetrace index .' first.[/red]")
         raise typer.Exit(1)
@@ -136,26 +239,26 @@ def chat(
                 )
 
     with console.status("[bold cyan]Waking up the Architect (loading Graph & Vectors)...", spinner="point"):
-        # Load the databases
+        # Load the databases.
         vs_config = VectorStoreConfig(persist_dir=str(db_dir / "chroma"))
         vector_store = VectorStore(config=vs_config)
-        
+
         graph = CodeGraph()
         graph.db_path = db_dir / "graph_metadata.db"
         graph._init_db()
         graph.load_from_db()
-        
-        # Initialize the LangChain Agent
+
+        # Initialize the httpx-powered Agent.
         try:
             agent = AgentOrchestrator(vector_store, graph)
         except ValueError as e:
-            # Catches errors from retriever.py if the API key is invalid
+            # Catch errors from the retriever if the API key is invalid.
             console.print(f"[red]Configuration Error: {e}[/red]")
             raise typer.Exit(1)
-            
-    console.print("\n[bold green]✓ Architect is online! Type 'exit' or 'quit' to stop.[/bold green]")
 
-    # ── Initialize ChatStore ──
+    console.print("[bold green]Architect is online! Type 'exit' or 'quit' to stop.[/bold green]")
+
+    # Initialize ChatStore
     chat_store = ChatStore(db_dir / "chat_history.db")
 
     if resume and chat_store.session_exists(resume):
@@ -168,14 +271,14 @@ def chat(
             console.print(f"[yellow]Session '{resume}' not found — starting a new session.[/yellow]")
         console.print(f"[dim]Session: {session_id}[/dim]")
 
-    console.print("─" * 60)
+    console.print("-" * 60)
 
     # 4. The Continuous Chat Loop
     while True:
-        # Prompt the user for a question
-        query = Prompt.ask("\n[bold blue]❯ You[/bold blue]")
-        
-        # Allow the user to exit the loop
+        # Prompt the user for a question.
+        query = Prompt.ask("\n[bold cyan]You[/bold cyan]")
+
+        # Allow the user to exit the loop.
         if query.strip().lower() in ["exit", "quit"]:
             chat_store.close()
             console.print("[bold magenta]Shutting down Architect. Goodbye![/bold magenta]")
@@ -185,11 +288,11 @@ def chat(
             session_id = chat_store.create_session(project=str(target_dir))
             console.print(f"[dim]New session started: {session_id}[/dim]")
             continue
-            
+
         if not query.strip():
             continue
 
-        # ── Guardrail: catch accidental API key paste ──
+        # Guardrail: Catch accidental API key pastes.
         if looks_like_api_key(query):
             console.print(
                 "[bold yellow]⚠  That looks like an API key, not a question![/bold yellow]\n"
@@ -198,32 +301,49 @@ def chat(
             )
             continue
 
-        # Execute the agentic pipeline
+        # Execute the agentic pipeline.
         try:
-            # Tool icon mapping
-            tool_icons = {
-                "search_codebase": "🔍",
-                "inspect_index": "🗂️",
-                "get_symbol_relations": "🔗",
-                "read_file": "📄",
-                "analyze_impact": "📊",
-                "write_file": "✏️",
-                "git_diff": "📝",
+            # Tool label mapping (ASCII-safe).
+            tool_labels = {
+                "search_codebase":      "Searching codebase",
+                "inspect_index":        "Inspecting index",
+                "get_symbol_relations": "Tracing symbol relations",
+                "read_file":            "Reading file",
+                "analyze_impact":       "Analyzing impact",
+                "write_file":           "Proposing file change",
+                "git_diff":             "Running git diff",
             }
 
             streaming_started = False
             full_response = ""
             live = None
+            # Transient status spinner shown while a tool is executing.
+            # Stopped and erased when the tool finishes or streaming begins.
+            _tool_status = None
 
             for event in agent.stream(query, chat_history=chat_store.get_history_for_llm(session_id)):
                 evt_type = event["type"]
 
                 if evt_type == "thought":
-                    icon = tool_icons.get(event.get("tool", ""), "🔧")
-                    console.print(f"  {icon} [dim italic]{event['message']}[/dim italic]")
+                    # Show a transient spinner for the current tool; it will be erased automatically.
+                    if _tool_status:
+                        _tool_status.stop()
+                    tool_name = event.get("tool", "")
+                    label = tool_labels.get(tool_name, "Working")
+                    # Append the tool argument detail from the event message.
+                    detail = event.get("message", "")
+                    # Provide context detail from the tool message.
+                    _tool_status = console.status(
+                        f"[dim]{detail}[/dim]",
+                        spinner="dots",
+                    )
+                    _tool_status.start()
 
                 elif evt_type == "tool_end":
-                    console.print(f"     [dim green]✓ done[/dim green]")
+                    # Erase the spinner without leaving a permanent line.
+                    if _tool_status:
+                        _tool_status.stop()
+                        _tool_status = None
 
                 elif evt_type == "token":
                     token_text = event.get("content", "")
@@ -231,6 +351,11 @@ def chat(
                         token_text = str(token_text)
                     if not token_text:
                         continue
+
+                    # Stop any lingering tool spinner before streaming begins.
+                    if _tool_status:
+                        _tool_status.stop()
+                        _tool_status = None
 
                     if not streaming_started:
                         console.print("\n[bold dark_orange]Architect:[/bold dark_orange]")
@@ -241,89 +366,116 @@ def chat(
                     live.update(Markdown(full_response))
 
                 elif evt_type == "done":
+                    if _tool_status:
+                        _tool_status.stop()
+                        _tool_status = None
                     if live:
                         live.stop()
                     if not streaming_started and not full_response:
-                        # Agent finished without streaming tokens
+                        # The agent finished without streaming tokens.
                         pass
 
-                    # ── Process pending writes (human-in-the-loop) ──
-                    pending_writes = get_pending_writes()
-                    if pending_writes:
-                        batches = _group_pending_writes_by_root_dir(pending_writes)
-                        console.print(
-                            f"\n[bold yellow]⚡ {len(pending_writes)} proposed change(s) "
-                            f"across {len(batches)} batch(es):[/bold yellow]"
-                        )
-                        total_changed = 0
-                        total_skipped = 0
-                        total_failed = 0
-                        remaining_batches: list[tuple[str, list[dict]]] = []
-                        for idx, (batch_name, batch_items) in enumerate(batches, start=1):
-                            console.print(
-                                f"\n[bold cyan]Batch {idx}/{len(batches)}[/bold cyan] "
-                                f"[dim]({batch_name}, {len(batch_items)} file(s))[/dim]"
-                            )
-                            batch_changed = 0
-                            batch_skipped = 0
-                            batch_failed = 0
-                            for pw in batch_items:
-                                approved = _show_diff_panel(console, pw)
-                                if approved:
-                                    result = write_file_impl(pw["file_path"], pw["content"])
-                                    if result.startswith("Successfully wrote"):
-                                        batch_changed += 1
-                                        console.print(f"  [bold green]✓ {result}[/bold green]")
-                                    else:
-                                        batch_failed += 1
-                                        console.print(f"  [bold red]✗ {result}[/bold red]")
-                                else:
-                                    batch_skipped += 1
-                                    console.print(f"  [dim]✗ Skipped: {Path(pw['file_path']).name}[/dim]")
+                elif evt_type == "error":
+                    # Surface async producer exceptions (API errors, auth failures, etc.)
+                    if _tool_status:
+                        _tool_status.stop()
+                        _tool_status = None
+                    if live:
+                        live.stop()
+                        live = None
+                    err_msg = event.get("message", "Unknown error")
+                    console.print(f"\n[bold red]Architect Error:[/bold red] {err_msg}")
+                    break
 
-                            total_changed += batch_changed
-                            total_skipped += batch_skipped
-                            total_failed += batch_failed
-                            console.print(
-                                f"  [bold green]Batch {idx} complete:[/bold green] "
-                                f"changed={batch_changed}, skipped={batch_skipped}, failed={batch_failed}"
-                            )
+                elif evt_type == "usage":
+                    # Token counter (this is the only persistent tool-activity line).
+                    turn_usage = event.get("turn")
+                    if turn_usage:
+                        console.print(turn_usage.format())
 
-                            if idx < len(batches):
-                                next_batch = Prompt.ask(
-                                    "  [bold yellow]Proceed to next batch now?[/bold yellow]",
-                                    choices=["y", "n"],
-                                    default="y",
-                                )
-                                if next_batch.lower() != "y":
-                                    remaining_batches.extend(batches[idx:])
-                                    break
-
-                        if remaining_batches:
-                            remaining = [pw for _, items in remaining_batches for pw in items]
-                            replace_pending_writes(remaining)
-                            next_batch_name = remaining_batches[0][0] if remaining_batches else "<none>"
-                            console.print(
-                                f"\n[yellow]Paused batch processing.[/yellow] "
-                                f"[dim]Next batch queued: {next_batch_name} "
-                                f"({len(remaining_batches[0][1]) if remaining_batches else 0} file(s)).[/dim]\n"
-                                f"[dim]{len(remaining)} pending change(s) kept for the next run.[/dim]"
-                            )
+            # Process pending writes (human-in-the-loop).
+            # This runs once per turn, after all events have been processed.
+            pending_writes = get_pending_writes()
+            if pending_writes:
+                batches = _group_pending_writes_by_root_dir(pending_writes)
+                console.print(
+                    f"\n[bold yellow]⚡ {len(pending_writes)} proposed change(s) "
+                    f"across {len(batches)} batch(es):[/bold yellow]"
+                )
+                total_changed = 0
+                total_skipped = 0
+                total_failed = 0
+                remaining_batches: list[tuple[str, list[dict]]] = []
+                for idx, (batch_name, batch_items) in enumerate(batches, start=1):
+                    console.print(
+                        f"\n[bold cyan]Batch {idx}/{len(batches)}[/bold cyan] "
+                        f"[dim]({batch_name}, {len(batch_items)} file(s))[/dim]"
+                    )
+                    batch_changed = 0
+                    batch_skipped = 0
+                    batch_failed = 0
+                    for pw in batch_items:
+                        approved = _show_diff_panel(console, pw)
+                        if approved:
+                            result = write_file_impl(pw["file_path"], pw["content"])
+                            if result.startswith("Successfully wrote"):
+                                batch_changed += 1
+                                console.print(f"  [bold green]✓ {result}[/bold green]")
+                            else:
+                                batch_failed += 1
+                                console.print(f"  [bold red]✗ {result}[/bold red]")
                         else:
-                            clear_pending_writes()
-                        console.print(
-                            f"[bold cyan]Edit summary:[/bold cyan] "
-                            f"changed={total_changed}, skipped={total_skipped}, failed={total_failed}"
+                            batch_skipped += 1
+                            console.print(f"  [dim]✗ Skipped: {Path(pw['file_path']).name}[/dim]")
+
+                    total_changed += batch_changed
+                    total_skipped += batch_skipped
+                    total_failed += batch_failed
+                    console.print(
+                        f"  [bold green]Batch {idx} complete:[/bold green] "
+                        f"changed={batch_changed}, skipped={batch_skipped}, failed={batch_failed}"
+                    )
+
+                    if idx < len(batches):
+                        next_batch = Prompt.ask(
+                            "  [bold yellow]Proceed to next batch now?[/bold yellow]",
+                            choices=["y", "n"],
+                            default="y",
                         )
+                        if next_batch.lower() != "y":
+                            remaining_batches.extend(batches[idx:])
+                            break
 
-                    console.print("─" * 60)
+                if remaining_batches:
+                    remaining = [pw for _, items in remaining_batches for pw in items]
+                    replace_pending_writes(remaining)
+                    next_batch_name = remaining_batches[0][0] if remaining_batches else "<none>"
+                    console.print(
+                        f"\n[yellow]Paused batch processing.[/yellow] "
+                        f"[dim]Next batch queued: {next_batch_name} "
+                        f"({len(remaining_batches[0][1]) if remaining_batches else 0} file(s)).[/dim]\n"
+                        f"[dim]{len(remaining)} pending change(s) kept for the next run.[/dim]"
+                    )
+                else:
+                    clear_pending_writes()
+                console.print(
+                    f"[bold cyan]Edit summary:[/bold cyan] "
+                    f"changed={total_changed}, skipped={total_skipped}, failed={total_failed}"
+                )
 
-            # ── Save messages to chat history ──
+            console.print("-" * 60)
+
+            # Save messages to chat history.
             chat_store.add_message(session_id, "user", query)
             if full_response:
                 chat_store.add_message(session_id, "assistant", full_response)
 
         except Exception as e:
+            if _tool_status:
+                try:
+                    _tool_status.stop()
+                except Exception:
+                    pass
             if live:
                 try:
                     live.stop()
@@ -359,17 +511,17 @@ def init(
 
     console.print("[bold]Starting Codetrace Setup[/bold]\n")
 
-    # ── Step 1: Config ──
-    console.print("[bold cyan]Step 1/4[/bold cyan] — Configuration")
+    # Step 1: Configuration.
+    console.print("[bold cyan]Step 1/4[/bold cyan] – Configuration")
     global_dir = Path.home() / ".codetrace"
     global_dir.mkdir(parents=True, exist_ok=True)
     config_path = global_dir / "config.json"
 
     if config_path.exists():
-        console.print("  [green]✓ Config already exists — skipping[/green]")
+        console.print("  [green]✓ Config already exists – skipping[/green]")
     else:
         if llm:
-            # Non-interactive: auto-configure with defaults
+            # Non-interactive: Auto-configure with defaults.
             config_data = {"provider": llm.lower(), "api_key": "", "model_name": "", "base_url": ""}
             if llm.lower() != "ollama":
                 api_key = Prompt.ask(f"  [cyan]Enter your {llm.upper()} API Key[/cyan]", password=True)
@@ -381,8 +533,8 @@ def init(
             _run_setup_wizard(config_path, is_reconfigure=False)
     console.print()
 
-    # ── Step 2: Download Models ──
-    console.print("[bold cyan]Step 2/4[/bold cyan] — Downloading Embedding Models")
+    # Step 2: Download Models.
+    console.print("[bold cyan]Step 2/4[/bold cyan] – Downloading Embedding Models")
 
     if fast:
         bge_model = "BAAI/bge-small-en-v1.5"
@@ -402,8 +554,8 @@ def init(
             console.print(f"  [green]✓ {name}[/green]")
     console.print()
 
-    # ── Step 3: Index Codebase ──
-    console.print("[bold cyan]Step 3/4[/bold cyan] — Indexing Codebase")
+    # Step 3: Index Codebase.
+    console.print("[bold cyan]Step 3/4[/bold cyan] – Indexing Codebase")
 
     if not db_dir.exists():
         db_dir.mkdir(parents=True, exist_ok=True)
@@ -420,8 +572,16 @@ def init(
         orchestrator.graph._init_db()
         orchestrator.graph.load_from_db()
 
-    all_files = [str(p) for p in target_dir.rglob("*.*")
-                 if ".codetrace" not in p.parts and ".git" not in p.parts]
+    # Discover files using os.walk with in-place pruning.
+    # ALWAYS_IGNORE_DIRS are pruned from the walk to avoid enumerating ignored contents.
+    # filter_paths then applies all .gitignore rules.
+    _raw_files = []
+    for dirpath, dirnames, filenames in os.walk(target_dir):
+        dirnames[:] = [d for d in dirnames if not _is_always_ignored(d)]
+        for fn in filenames:
+            _raw_files.append(Path(dirpath) / fn)
+    _raw_files = orchestrator.graph.filter_paths(_raw_files, repo_root=target_dir)
+    all_files = [str(p) for p in _raw_files]
     supported_files = [f for f, _ in orchestrator.parser.iter_supported_files(all_files)]
     supported_set = set(supported_files)
 
@@ -431,7 +591,7 @@ def init(
     if deleted_files:
         for df in deleted_files:
             if df in supported_set:
-                orchestrator.graph.prune_file(df)
+                orchestrator.graph.prune_files([df])
             sync_manager.remove_file_record(df)
             sync_manager.remove_file_snapshot(df)
 
@@ -449,29 +609,86 @@ def init(
             sync_manager.upsert_file_snapshot_from_disk(file_path, file_hash=file_hash)
 
     if changed_supported_file_pairs:
-            start_time = time.time()
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                transient=False,
-            ) as progress:
-                task = progress.add_task(
-                    f"  [cyan]Parsing & Indexing {len(changed_supported_file_pairs)} files...",
-                    total=len(changed_supported_file_pairs)
-                )
-                for file_path, _ in changed_supported_file_pairs:
-                    orchestrator.build_from_file(file_path, vector_store=vector_store)
-                    progress.advance(task)
-
-            orchestrator.graph.persist_to_db()
-            sync_manager.mark_files_synced_batch(changed_all_file_pairs)
-            sync_manager.update_index_manifest(
-                target_dir,
-                sync_manager.get_all_tracked_file_hashes(),
-                supported_file_count=len(supported_files),
+        start_time = time.time()
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            GradientBarColumn(),
+            transient=False,
+        ) as progress:
+            task = progress.add_task(
+                f"  [cyan]Parsing & Indexing {len(changed_supported_file_pairs)} files...",
+                total=len(changed_supported_file_pairs)
             )
-            elapsed = time.time() - start_time
-            console.print(f"  [green]✓ Indexed {len(supported_files)} files in {elapsed:.2f}s[/green]")
+
+            # Parse all changed files in parallel.
+            MAX_WORKERS = max(4, os.cpu_count() or 4)
+            all_symbols = []
+            all_calls = []
+            all_vs_ids = []
+            all_vs_contents = []
+            all_vs_metadatas = []
+
+            def _parse_one(file_path: str) -> dict:
+                return orchestrator.extract_from_file(file_path)
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                futures = {ex.submit(_parse_one, fp): fp for fp, _ in changed_supported_file_pairs}
+
+                for fut in as_completed(futures):
+                    fp = futures[fut]
+                    try:
+                        result = fut.result()
+                        all_symbols.extend([(fp, s) for s in result["symbols"]])
+                        all_calls.extend([(fp, c) for c in result["calls"]])
+                        for v in result["vs_data"]:
+                            all_vs_ids.append(v["id"])
+                            all_vs_contents.append(v["content"])
+                            all_vs_metadatas.append(v["metadata"])
+                        progress.advance(task)
+                    except Exception as e:
+                        logger.error("Failed to parse %s: %s", fp, e)
+
+            # Batch build the graph.
+            name_to_id: dict[str, str] = {}
+            qualified_to_id: dict[str, str] = {}
+            nodes_batch = []
+            edges_batch = []
+
+            for file_path, s in all_symbols:
+                qualified_name = s.get("qualified_name") or s["name"]
+                symbol_id = f"{file_path}:{qualified_name}"
+                nodes_batch.append((symbol_id, s["type"], file_path))
+                name_to_id[s["name"]] = symbol_id
+                qualified_to_id[qualified_name] = symbol_id
+
+            for file_path, c in all_calls:
+                caller_id = f"{file_path}:{c['caller']}"
+                callee_id = qualified_to_id.get(c["callee"]) or name_to_id.get(c["callee"])
+                if not callee_id:
+                    candidates = [
+                        sid for qn, sid in qualified_to_id.items()
+                        if qn.endswith(f".{c['callee']}")
+                    ]
+                    if len(candidates) == 1:
+                        callee_id = candidates[0]
+                edges_batch.append((caller_id, callee_id or c["callee"]))
+
+            orchestrator.graph.add_nodes_batch(nodes_batch)
+            orchestrator.graph.add_edges_batch(edges_batch)
+
+            if vector_store and all_vs_ids:
+                vector_store.add_symbols_batch(all_vs_ids, all_vs_contents, all_vs_metadatas)
+
+        orchestrator.graph.persist_to_db()
+        sync_manager.mark_files_synced_batch(changed_all_file_pairs)
+        sync_manager.update_index_manifest(
+            target_dir,
+            sync_manager.get_all_tracked_file_hashes(),
+            supported_file_count=len(supported_files),
+        )
+        elapsed = time.time() - start_time
+        console.print(f"  [green]✓ Indexed {len(supported_files)} files in {elapsed:.2f}s[/green]")
     else:
         if changed_all_file_pairs:
             sync_manager.mark_files_synced_batch(changed_all_file_pairs)
@@ -490,14 +707,14 @@ def init(
             console.print("  [green]✓ Codebase is already up to date[/green]")
     console.print()
 
-    # ── Step 4: Register MCP ──
-    console.print("[bold cyan]Step 4/4[/bold cyan] — Registering MCP for IDEs")
+    # Step 4: Register MCP.
+    console.print("[bold cyan]Step 4/4[/bold cyan] – Registering MCP for IDEs")
     mcp_results = _register_mcp(target_dir)
     for msg in mcp_results:
         console.print(f"  {msg}")
     console.print()
 
-    # ── Final Summary ──
+    # Final Summary.
     console.print(Panel(
         f"[bold green]✅ Codetrace is ready![/bold green]\n\n"
         f"  Indexed:  [bold]{target_dir}[/bold]\n"
@@ -506,7 +723,6 @@ def init(
         title="Setup Complete",
         border_style="green"
     ))
-
 
 @app.command()
 def index(path: str = typer.Argument(".", help="Target directory or GitHub URL to index")):
@@ -519,8 +735,9 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
       codetrace index https://github.com/user/repo/tree/develop
     """
     print_banner()
+    print_system_info()
 
-    # ── Detect remote repo URL vs local path ──
+    # Detect remote repo URL vs local path.
     cloned_dir = None
     repo_info = _parse_github_url(path)
 
@@ -534,7 +751,7 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
         try:
             with console.status("[bold cyan]Running git clone --depth 1...", spinner="dots"):
                 cloned_dir = _clone_repo(repo_info["clone_url"], repo_info["branch"])
-            console.print(f"  [green]✓ Cloned to:[/green] [dim]{cloned_dir}[/dim]\n")
+            console.print(f"  [green]\u2713 Cloned to:[/green] [dim]{cloned_dir}[/dim]\n")
         except RuntimeError as e:
             console.print(f"[bold red]Clone failed:[/bold red] {e}")
             raise typer.Exit(1)
@@ -545,7 +762,7 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
 
     db_dir = target_dir / ".codetrace"
 
-    # Auto-init if not yet initialized (especially for cloned repos)
+    # Auto-initialize if necessary, especially for cloned repositories.
     if not db_dir.exists():
         db_dir.mkdir(parents=True, exist_ok=True)
         SyncManager(db_dir=str(db_dir))
@@ -553,24 +770,32 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
     console.print(f"[bold blue]Starting Codetrace Indexer[/bold blue] \U0001f680")
     console.print(f"Target: [dim]{target_dir}[/dim]\n")
 
-    # 1. Boot up the engines
+    # 1. Initialize databases and models.
     with console.status("[bold cyan]Waking up Vector Models and DB connections...", spinner="point"):
         sync_manager = SyncManager(db_dir=str(db_dir))
         orchestrator = GraphOrchestrator()
-        
+
         vs_config = VectorStoreConfig(persist_dir=str(db_dir / "chroma"))
         vector_store = VectorStore(config=vs_config)
-        
+
         orchestrator.graph.db_path = db_dir / "graph_metadata.db"
         orchestrator.graph._init_db()
         orchestrator.graph.load_from_db()
 
     # 2. Discover files
-    all_files = [str(p) for p in target_dir.rglob("*.*")
-                 if ".codetrace" not in p.parts and ".git" not in p.parts]
+    # Discover files using os.walk with in-place pruning.
+    # ALWAYS_IGNORE_DIRS are pruned from the walk to avoid enumerating ignored contents.
+    # filter_paths then applies all .gitignore rules.
+    _raw_files = []
+    for dirpath, dirnames, filenames in os.walk(target_dir):
+        dirnames[:] = [d for d in dirnames if not _is_always_ignored(d)]
+        for fn in filenames:
+            _raw_files.append(Path(dirpath) / fn)
+    _raw_files = orchestrator.graph.filter_paths(_raw_files, repo_root=target_dir)
+    all_files = [str(p) for p in _raw_files]
     supported_files = [f for f, _ in orchestrator.parser.iter_supported_files(all_files)]
     supported_set = set(supported_files)
-    
+
     if not supported_files:
         console.print("[yellow]No supported code files found in this directory.[/yellow]")
 
@@ -582,14 +807,14 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
         if file_path in supported_set
     ]
     deleted_files = sync_manager.get_deleted_files(all_files)
-    
+
     if not changed_all_file_pairs and not deleted_files:
         sync_manager.update_index_manifest(
             target_dir,
             sync_manager.get_all_tracked_file_hashes(),
             supported_file_count=len(supported_files),
         )
-        console.print("[bold green]✓ Codebase is fully up to date![/bold green]")
+        console.print("[bold green]\u2713 Codebase is fully up to date![/bold green]")
         if cloned_dir:
             shutil.rmtree(cloned_dir, ignore_errors=True)
         return
@@ -599,7 +824,7 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
         with console.status(f"[bold red]Pruning {len(deleted_files)} deleted files..."):
             for df in deleted_files:
                 if df in supported_set:
-                    orchestrator.graph.prune_file(df)
+                    orchestrator.graph.prune_files([df])
                 sync_manager.remove_file_record(df)
                 sync_manager.remove_file_snapshot(df)
 
@@ -611,23 +836,78 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
     # 5. Ingestion Loop (Parsing & Embedding)
     if changed_supported_file_pairs:
         start_time = time.time()
-        
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             transient=False,
         ) as progress:
-            
+
             task = progress.add_task(
-                f"[cyan]Parsing & Indexing {len(changed_supported_file_pairs)} files...", 
+                f"[cyan]Parsing & Indexing {len(changed_supported_file_pairs)} files...",
                 total=len(changed_supported_file_pairs)
             )
-            
-            for file_path, _ in changed_supported_file_pairs:
-                orchestrator.build_from_file(file_path, vector_store=vector_store)
-                progress.advance(task)
 
-        # 6. Save State
+            # Parse all changed files in parallel.
+            MAX_WORKERS = max(4, os.cpu_count() or 4)
+            all_symbols = []
+            all_calls = []
+            all_vs_ids = []
+            all_vs_contents = []
+            all_vs_metadatas = []
+
+            def _parse_one(file_path: str) -> dict:
+                return orchestrator.extract_from_file(file_path)
+
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+                futures = {ex.submit(_parse_one, fp): fp for fp, _ in changed_supported_file_pairs}
+
+                for fut in as_completed(futures):
+                    fp = futures[fut]
+                    try:
+                        result = fut.result()
+                        all_symbols.extend([(fp, s) for s in result["symbols"]])
+                        all_calls.extend([(fp, c) for c in result["calls"]])
+                        for v in result["vs_data"]:
+                            all_vs_ids.append(v["id"])
+                            all_vs_contents.append(v["content"])
+                            all_vs_metadatas.append(v["metadata"])
+                        progress.advance(task)
+                    except Exception as e:
+                        logger.error("Failed to parse %s: %s", fp, e)
+
+            # Batch build the graph.
+            name_to_id: dict[str, str] = {}
+            qualified_to_id: dict[str, str] = {}
+            nodes_batch = []
+            edges_batch = []
+
+            for file_path, s in all_symbols:
+                qualified_name = s.get("qualified_name") or s["name"]
+                symbol_id = f"{file_path}:{qualified_name}"
+                nodes_batch.append((symbol_id, s["type"], file_path))
+                name_to_id[s["name"]] = symbol_id
+                qualified_to_id[qualified_name] = symbol_id
+
+            for file_path, c in all_calls:
+                caller_id = f"{file_path}:{c['caller']}"
+                callee_id = qualified_to_id.get(c["callee"]) or name_to_id.get(c["callee"])
+                if not callee_id:
+                    candidates = [
+                        sid for qn, sid in qualified_to_id.items()
+                        if qn.endswith(f".{c['callee']}")
+                    ]
+                    if len(candidates) == 1:
+                        callee_id = candidates[0]
+                edges_batch.append((caller_id, callee_id or c["callee"]))
+
+            orchestrator.graph.add_nodes_batch(nodes_batch)
+            orchestrator.graph.add_edges_batch(edges_batch)
+
+            if vector_store and all_vs_ids:
+                vector_store.add_symbols_batch(all_vs_ids, all_vs_contents, all_vs_metadatas)
+
+        # 6. Save State.
         with console.status("[bold magenta]Persisting Graph and Sync states..."):
             orchestrator.graph.persist_to_db()
             sync_manager.mark_files_synced_batch(changed_all_file_pairs)
@@ -638,7 +918,7 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
             )
 
         elapsed = time.time() - start_time
-        console.print(f"\n[bold green]✓ Indexing complete in {elapsed:.2f}s![/bold green]")
+        console.print(f"\n[bold green]\u2713 Indexing complete in {elapsed:.2f}s![/bold green]")
     else:
         if changed_all_file_pairs:
             sync_manager.mark_files_synced_batch(changed_all_file_pairs)
@@ -648,9 +928,9 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
             supported_file_count=len(supported_files),
         )
         if changed_all_file_pairs:
-            console.print("\n[bold green]✓ Snapshot update complete (no supported code deltas).[/bold green]")
+            console.print("\n[bold green]\u2713 Snapshot update complete (no supported code deltas).[/bold green]")
 
-    # 7. Cleanup cloned repo (database persists in the temp .codetrace/)
+    # 7. Cleanup cloned repository.
     if cloned_dir:
         console.print(f"\n[dim]Cloned repo cleaned up. Index stored at: {db_dir}[/dim]")
         # Note: we keep the .codetrace dir within the temp clone for now.
@@ -672,7 +952,7 @@ def config():
         _run_setup_wizard(config_path, is_reconfigure=False)
         return
 
-    # Show current config with masked key
+    # Show current configuration with masked key.
     with open(config_path) as f:
         cfg = json.load(f)
 
@@ -684,7 +964,7 @@ def config():
         border_style="cyan"
     ))
 
-    # Ask for confirmation before overwriting
+    # Ask for confirmation before overwriting.
     overwrite = Prompt.ask(
         "\n[yellow]Overwrite this configuration?[/yellow]",
         choices=["y", "n"],
@@ -700,6 +980,10 @@ def config():
 def visualize(path: str = typer.Argument(".", help="Target directory")):
     """
     Export the code dependency graph as an interactive HTML visualization.
+
+    Generates a self-contained HTML file showing a folder-level architecture
+    map with cross-folder function call edges, hover tooltips, search, and
+    a detail sidebar.
     """
     print_banner()
     target_dir = get_project_root(path)
@@ -723,351 +1007,159 @@ def visualize(path: str = typer.Argument(".", help="Target directory")):
         return
 
     with console.status("[bold cyan]Generating interactive visualization...", spinner="dots"):
-        try:
-            from pyvis.network import Network
-        except ImportError:
-            console.print(
-                "[red]pyvis is required for visualization.[/red]\n"
-                "Install it with: [cyan]pip install pyvis[/cyan]"
-            )
-            raise typer.Exit(1)
+        viz_data = _build_viz_data(graph, target_dir)
 
-        net = Network(
-            height="900px",
-            width="100%",
-            directed=True,
-            bgcolor="#0f172a",
-            font_color="#e2e8f0",
-        )
-
-        # Color palette by node type
-        type_colors = {
-            "function":  "#4fc3f7",   # light blue
-            "class":     "#ff8a65",   # orange
-            "method":    "#81c784",   # green
-            "module":    "#ba68c8",   # purple
-            "variable":  "#fff176",   # yellow
-            "unknown":   "#90a4ae",   # grey
-        }
-
-        project_node_id = f"project:{target_dir.name}"
-        net.add_node(
-            project_node_id,
-            label=target_dir.name,
-            title=f"Project: {target_dir}",
-            color="#f43f5e",
-            size=28,
-            shape="diamond",
-            level=0,
-        )
-
-        dir_node_ids: dict[str, str] = {}
-        file_node_ids: dict[str, str] = {}
-        file_levels: dict[str, int] = {}
-        for node, data in graph.direct_graph.nodes(data=True):
-            n_type = data.get("type", "unknown")
-            n_file = data.get("file", "")
-            # Use short label (just the symbol name)
-            label = node.split(":")[-1] if ":" in node else node
-            color = type_colors.get(n_type, type_colors["unknown"])
-
-            file_path_str = str(n_file) if n_file else "<unknown>"
-            if file_path_str not in file_node_ids:
-                file_node_id = f"file:{file_path_str}"
-                file_node_ids[file_path_str] = file_node_id
-                file_name = Path(file_path_str).name if file_path_str != "<unknown>" else "<unknown>"
-
-                parent_node_id = project_node_id
-                level = 1
-                if file_path_str != "<unknown>":
-                    try:
-                        rel_parts = Path(file_path_str).resolve().relative_to(target_dir.resolve()).parts
-                    except Exception:
-                        rel_parts = Path(file_path_str).parts
-
-                    dir_parts = rel_parts[:-1] if len(rel_parts) > 1 else []
-                    current_rel = ""
-                    for part in dir_parts:
-                        current_rel = f"{current_rel}/{part}" if current_rel else part
-                        dir_node_id = f"dir:{current_rel}"
-                        if dir_node_id not in dir_node_ids:
-                            dir_node_ids[dir_node_id] = dir_node_id
-                            net.add_node(
-                                dir_node_id,
-                                label=part,
-                                title=f"Directory: {current_rel}",
-                                color="#2dd4bf",
-                                size=18,
-                                shape="ellipse",
-                                level=level,
-                            )
-                            net.add_edge(
-                                parent_node_id,
-                                dir_node_id,
-                                title="contains",
-                                kind="structure",
-                                color="#64748b",
-                                arrows="to",
-                                width=1.2,
-                                dashes=True,
-                            )
-                        parent_node_id = dir_node_id
-                        level += 1
-
-                net.add_node(
-                    file_node_id,
-                    label=file_name,
-                    title=f"File: {file_path_str}",
-                    color="#a78bfa",
-                    size=16,
-                    shape="box",
-                    level=level,
-                )
-                net.add_edge(
-                    parent_node_id,
-                    file_node_id,
-                    title="contains",
-                    kind="structure",
-                    color="#64748b",
-                    arrows="to",
-                    width=1.2,
-                    dashes=True,
-                )
-                file_levels[file_path_str] = level
-
-            symbol_level = file_levels.get(file_path_str, 2)
-            net.add_node(
-                node,
-                label=label,
-                title=f"{node}\nType: {n_type}\nFile: {n_file}",
-                color=color,
-                size=20 if n_type == "class" else 12,
-                shape="dot",
-                level=symbol_level + (2 if n_type == "method" else 1),
-            )
-
-            parent_file_node = file_node_ids.get(file_path_str)
-            if parent_file_node:
-                net.add_edge(
-                    parent_file_node,
-                    node,
-                    title="defines",
-                    kind="structure",
-                    color="#94a3b8",
-                    arrows="to",
-                    width=1.1,
-                    dashes=True,
-                )
-
-        # Edge colors by relation
-        edge_colors = {
-            "calls":   "#4dd0e1",
-            "defines": "#ffb74d",
-        }
-
-        for src, tgt, data in graph.direct_graph.edges(data=True):
-            relation = data.get("relation", "calls")
-            net.add_edge(
-                src, tgt,
-                title=relation,
-                kind="semantic",
-                color=edge_colors.get(relation, "#38bdf8"),
-                arrows="to",
-                width=2.0 if relation == "calls" else 1.6,
-            )
-
-        net.set_options(
-            """
-            var options = {
-              "layout": {
-                "hierarchical": {
-                  "enabled": true,
-                  "direction": "UD",
-                  "sortMethod": "directed",
-                  "nodeSpacing": 220,
-                  "treeSpacing": 240,
-                  "levelSeparation": 140,
-                  "blockShifting": true,
-                  "edgeMinimization": true,
-                  "parentCentralization": true,
-                  "shakeTowards": "roots"
-                }
-              },
-              "physics": {
-                "enabled": false
-              },
-              "interaction": {
-                "hover": true,
-                "navigationButtons": true,
-                "keyboard": true
-              },
-              "nodes": {
-                "font": {
-                  "size": 18,
-                  "face": "Consolas"
-                }
-              },
-              "edges": {
-                "smooth": false
-              }
-            }
-            """
-        )
+        from src.cli.visualization_template import render as render_viz
+        html = render_viz(viz_data)
 
         output_path = db_dir / "graph_visualization.html"
-        net.save_graph(str(output_path))
-
-        # Inject click-to-expand tree behavior into the generated HTML.
-        html = output_path.read_text(encoding="utf-8")
-        interaction_script = f"""
-<script type="text/javascript">
-(function () {{
-  if (typeof network === "undefined" || typeof nodes === "undefined" || typeof edges === "undefined") {{
-    return;
-  }}
-
-  const ROOT_ID = {project_node_id!r};
-  const allNodes = nodes.get();
-  const allEdges = edges.get();
-  const childrenByParent = {{}};
-  const expanded = {{}};
-  const visible = new Set([ROOT_ID]);
-
-  for (const e of allEdges) {{
-    if (e.kind === "structure") {{
-      if (!childrenByParent[e.from]) {{
-        childrenByParent[e.from] = [];
-      }}
-      childrenByParent[e.from].push(e.to);
-    }}
-  }}
-
-  function setInitialState() {{
-    const nodeUpdates = allNodes.map((n) => {{
-      const hasChildren = (childrenByParent[n.id] || []).length > 0;
-      const baseLabel = n.label || String(n.id);
-      return {{
-        id: n.id,
-        hidden: n.id !== ROOT_ID,
-        label: hasChildren ? baseLabel + " [+]" : baseLabel,
-      }};
-    }});
-    nodes.update(nodeUpdates);
-
-    const edgeUpdates = allEdges.map((e) => ({{
-      id: e.id,
-      hidden: true,
-    }}));
-    edges.update(edgeUpdates);
-
-    network.fit({{ nodes: [ROOT_ID], animation: false }});
-  }}
-
-  function updateEdges() {{
-    const updates = allEdges.map((e) => {{
-      const bothVisible = visible.has(e.from) && visible.has(e.to);
-      return {{ id: e.id, hidden: !bothVisible }};
-    }});
-    edges.update(updates);
-  }}
-
-  function collapseSubtree(nodeId) {{
-    const queue = [...(childrenByParent[nodeId] || [])];
-    while (queue.length) {{
-      const current = queue.shift();
-      visible.delete(current);
-      expanded[current] = false;
-      for (const child of (childrenByParent[current] || [])) {{
-        queue.push(child);
-      }}
-    }}
-    const updates = allNodes
-      .filter((n) => n.id !== ROOT_ID)
-      .map((n) => ({{
-        id: n.id,
-        hidden: !visible.has(n.id),
-      }}));
-    nodes.update(updates);
-  }}
-
-  function toggleNode(nodeId) {{
-    const children = childrenByParent[nodeId] || [];
-    if (!children.length) {{
-      return;
-    }}
-
-    if (expanded[nodeId]) {{
-      collapseSubtree(nodeId);
-      expanded[nodeId] = false;
-    }} else {{
-      for (const child of children) {{
-        visible.add(child);
-      }}
-      nodes.update(children.map((id) => ({{
-        id,
-        hidden: false,
-      }})));
-      expanded[nodeId] = true;
-    }}
-
-    const current = nodes.get(nodeId);
-    if (current) {{
-      const base = String(current.label || "").replace(" [+]", "").replace(" [-]", "");
-      nodes.update({{ id: nodeId, label: base + (expanded[nodeId] ? " [-]" : " [+]") }});
-    }}
-
-    updateEdges();
-    const nodePos = network.getPosition(nodeId);
-    network.moveTo({{
-      position: nodePos,
-      scale: Math.max(network.getScale(), 1.0),
-      animation: {{ duration: 220 }}
-    }});
-  }}
-
-  network.on("click", function (params) {{
-    if (!params.nodes || !params.nodes.length) {{
-      return;
-    }}
-    toggleNode(params.nodes[0]);
-  }});
-
-  setInitialState();
-  network.setOptions({{
-    layout: {{
-      hierarchical: {{
-        enabled: true,
-        direction: "UD",
-        nodeSpacing: 220,
-        treeSpacing: 240,
-        levelSeparation: 140,
-        parentCentralization: true,
-        blockShifting: true,
-        edgeMinimization: true
-      }}
-    }}
-  }});
-}})();
-</script>
-"""
-        html = html.replace("</body>", interaction_script + "\n</body>")
         output_path.write_text(html, encoding="utf-8")
+
+    cross_calls = viz_data["totalConnections"]
+    folder_count = viz_data["totalFolders"]
 
     console.print(Panel(
         f"[green]Graph exported successfully![/green]\n\n"
-        f"Nodes: [bold]{node_count}[/bold]  |  Edges: [bold]{edge_count}[/bold]\n\n"
+        f"Nodes: [bold]{node_count}[/bold]  |  Edges: [bold]{edge_count}[/bold]\n"
+        f"Folders: [bold]{folder_count}[/bold]  |  Cross-folder calls: [bold]{cross_calls}[/bold]\n\n"
         f"Open in browser: [bold cyan]{output_path}[/bold cyan]\n\n"
-        f"[bold]Interaction:[/bold] Click root, directory, or file nodes to expand/collapse one level.\n\n"
-        f"[dim]Legend: "
-        f"[#4fc3f7]● function[/#4fc3f7]  "
-        f"[#ff8a65]● class[/#ff8a65]  "
-        f"[#81c784]● method[/#81c784]  "
-        f"[#ba68c8]● module[/#ba68c8]  "
-        f"[#fff176]● variable[/#fff176][/dim]",
+        f"[bold]Interactions:[/bold]\n"
+        f"  [dim]Hover[/dim]  folder \u2192 highlight connections & show breakdown\n"
+        f"  [dim]Hover[/dim]  edge \u2192 see which functions call each other\n"
+        f"  [dim]Click[/dim]  folder \u2192 open detail sidebar (files, symbols, deps)\n"
+        f"  [dim]Search[/dim] \u2192 find symbols and highlight their folder\n"
+        f"  [dim]Drag[/dim]   \u2192 rearrange layout  |  [dim]Scroll[/dim] \u2192 zoom",
         title="Code Architecture Visualization",
         border_style="cyan"
     ))
 
+
+def _build_viz_data(graph: "CodeGraph", target_dir: Path) -> dict:
+    """
+    Extract folder-level architecture data from the CodeGraph.
+
+    Groups all symbols by their parent folder (relative to project root),
+    then aggregates cross-folder call edges with the actual function names
+    so the visualization can show both the high-level architecture and the
+    specific function-to-function connections.
+    """
+    resolved_root = target_dir.resolve()
+
+    # Pass 1: Group nodes by file and folder.
+    files_map: dict[str, dict] = {}   # relative_path -> {folder, name, symbols}
+    folders_map: dict[str, dict] = {} # folder_id -> {files, types}
+
+    for node_id, data in graph.direct_graph.nodes(data=True):
+        n_type = data.get("type", "unknown")
+        n_file = data.get("file", "")
+        if not n_file:
+            continue
+
+        # Make path relative and normalize separators.
+        try:
+            rel_path = str(Path(n_file).resolve().relative_to(resolved_root))
+        except ValueError:
+            rel_path = Path(n_file).name
+        rel_path = rel_path.replace("\\", "/")
+
+        # Determine folder.
+        parts = rel_path.rsplit("/", 1)
+        if len(parts) == 2:
+            folder, file_name = parts
+        else:
+            folder, file_name = "(root)", parts[0]
+
+        # Extract symbol name from the node_id.
+        symbol_name = node_id.rsplit(":", 1)[-1] if ":" in node_id else node_id
+
+        # Track file.
+        if rel_path not in files_map:
+            files_map[rel_path] = {"folder": folder, "name": file_name, "symbols": []}
+        files_map[rel_path]["symbols"].append({
+            "id": node_id, "name": symbol_name, "type": n_type,
+        })
+
+        # Track folder.
+        if folder not in folders_map:
+            folders_map[folder] = {"files": set(), "types": {}}
+        folders_map[folder]["files"].add(rel_path)
+        folders_map[folder]["types"][n_type] = folders_map[folder]["types"].get(n_type, 0) + 1
+
+    # Pass 2: Aggregate cross-folder call edges.
+    folder_edges_map: dict[tuple[str, str], dict] = {}
+
+    for src, tgt, data in graph.direct_graph.edges(data=True):
+        if data.get("relation") != "calls":
+            continue
+
+        src_file = graph.direct_graph.nodes.get(src, {}).get("file", "")
+        tgt_file = graph.direct_graph.nodes.get(tgt, {}).get("file", "")
+        if not src_file or not tgt_file or src_file == tgt_file:
+            continue
+
+        try:
+            src_rel = str(Path(src_file).resolve().relative_to(resolved_root)).replace("\\", "/")
+            tgt_rel = str(Path(tgt_file).resolve().relative_to(resolved_root)).replace("\\", "/")
+        except ValueError:
+            continue
+
+        src_parts = src_rel.rsplit("/", 1)
+        tgt_parts = tgt_rel.rsplit("/", 1)
+        src_folder = src_parts[0] if len(src_parts) == 2 else "(root)"
+        tgt_folder = tgt_parts[0] if len(tgt_parts) == 2 else "(root)"
+
+        if src_folder == tgt_folder:
+            continue
+
+        key = (src_folder, tgt_folder)
+        if key not in folder_edges_map:
+            folder_edges_map[key] = {"weight": 0, "calls": []}
+        folder_edges_map[key]["weight"] += 1
+
+        # Record individual call details.
+        if len(folder_edges_map[key]["calls"]) < 25:
+            src_name = src.rsplit(":", 1)[-1] if ":" in src else src
+            tgt_name = tgt.rsplit(":", 1)[-1] if ":" in tgt else tgt
+            folder_edges_map[key]["calls"].append({
+                "sourceName": src_name,
+                "targetName": tgt_name,
+                "sourceFile": src_parts[-1],
+                "targetFile": tgt_parts[-1],
+            })
+
+    # Build final JSON structure.
+    folders_list = []
+    for fid, info in sorted(folders_map.items()):
+        symbol_count = sum(info["types"].values())
+        dominant = max(info["types"], key=info["types"].get) if info["types"] else "unknown"
+        folders_list.append({
+            "id": fid, "name": fid,
+            "fileCount": len(info["files"]),
+            "symbolCount": symbol_count,
+            "types": info["types"],
+            "dominantType": dominant,
+        })
+
+    edges_list = [
+        {"source": src, "target": tgt, "weight": info["weight"], "calls": info["calls"]}
+        for (src, tgt), info in folder_edges_map.items()
+    ]
+
+    files_list = [
+        {"path": p, "folder": info["folder"], "name": info["name"], "symbols": info["symbols"]}
+        for p, info in sorted(files_map.items())
+    ]
+
+    return {
+        "projectName": target_dir.name,
+        "folders": folders_list,
+        "folderEdges": edges_list,
+        "files": files_list,
+        "totalSymbols": sum(f["symbolCount"] for f in folders_list),
+        "totalFiles": len(files_map),
+        "totalFolders": len(folders_map),
+        "totalConnections": sum(e["weight"] for e in edges_list),
+    }
 
 @app.command()
 def history():
@@ -1106,7 +1198,6 @@ def history():
 
     console.print(table)
     console.print("\n[dim]Resume a session:[/dim] [cyan]codetrace chat --resume <ID>[/cyan]")
-
 
 @app.command()
 def export(

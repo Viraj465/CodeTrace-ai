@@ -28,7 +28,10 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-# Import shared core logic (no duplication)
+# server.py is an entry-point script that lives outside the src/ package.
+# It is launched with the project root on sys.path (via pyproject.toml scripts or
+# direct invocation), so absolute 'src.*' imports are intentional and correct here.
+# Do NOT convert these to relative imports — relative imports only work inside a package.
 from src.core.agents.tools import (
     search_codebase_impl,
     inspect_index_impl,
@@ -224,7 +227,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         result = analyze_impact_impl(graph, arguments["symbol_id"])
 
     elif name == "write_file":
-        result = write_file_impl(arguments["file_path"], arguments["content"])
+        result = write_file_impl(
+            arguments["file_path"], 
+            arguments["content"], 
+            project_root=str(Path.cwd().resolve())
+        )
 
     elif name == "git_diff":
         result = git_diff_impl(".", arguments.get("target", "HEAD"))

@@ -1,11 +1,13 @@
+import threading
 from importlib import import_module
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 from tree_sitter import Language, Parser, Query, QueryCursor
 
-from src.core.parser.ast_utility import build_qualified_name, resolve_enclosing_function
-from src.file_extension import EXTENSIONS_MAP
+# Relative imports are used to resolve correctly for IDEs (like Pyrefly or Pylance) inside the package.
+from .ast_utility import build_qualified_name, resolve_enclosing_function
+from ...file_extension import EXTENSIONS_MAP
 
 
 LANGUAGE_MODULES: dict[str, tuple[str, str, str]] = {
@@ -22,6 +24,11 @@ LANGUAGE_MODULES: dict[str, tuple[str, str, str]] = {
     "html": ("tree_sitter_html", "tree-sitter-html", "language"),
     "json": ("tree_sitter_json", "tree-sitter-json", "language"),
     "css": ("tree_sitter_css", "tree-sitter-css", "language"),
+    # New languages
+    "c_sharp": ("tree_sitter_c_sharp", "tree-sitter-c-sharp", "language"),
+    "swift": ("tree_sitter_swift", "tree-sitter-swift", "language"),
+    "kotlin": ("tree_sitter_kotlin", "tree-sitter-kotlin", "language"),
+    "bash": ("tree_sitter_bash", "tree-sitter-bash", "language"),
     # "dart": ("tree_sitter_dart_orchard", "tree-sitter-dart-orchard", "language"),
 }
 
@@ -31,15 +38,36 @@ class CodeParser:
         self.default_extensions = default_extensions
         self.query_dir = Path(__file__).parent / "queries"
         self.default_language_name = EXTENSIONS_MAP.get(default_extensions, "python")
-        self._parser_cache: dict[str, object] = {}
+
+        # Language objects are immutable after creation, making them safe to share across threads.
         self._language_cache: dict[str, object] = {}
+        self._language_lock = threading.Lock()
+
+        # Parser objects hold mutable C-level state such as incremental parse buffers.
+        # Since they are not thread-safe, we use threading.local() so each worker
+        # thread in the ThreadPoolExecutor gets its own Parser instance.
+        self._thread_local = threading.local()
+
+        # Query objects are read-only once compiled, making them safe to share.
+        # However, compilation itself is not thread-safe, so it is protected with a lock.
+        self._query_cache: dict[str, Query] = {}
+        self._query_lock = threading.Lock()
+
         self.supported_languages = set(LANGUAGE_MODULES.keys())
         self.supported_languages.update({p.stem for p in self.query_dir.glob("*.scm")})
         self.default_language = self._get_language(self.default_language_name)
         self.default_parser = self._get_parser(self.default_language_name)
 
     def _get_language(self, language_name: str):
-        if language_name not in self._language_cache:
+        # Double-checked locking is used here: the fast path avoids the lock on a cache hit.
+        if language_name in self._language_cache:
+            return self._language_cache[language_name]
+
+        with self._language_lock:
+            # Re-check inside the lock in case another thread populated it.
+            if language_name in self._language_cache:
+                return self._language_cache[language_name]
+
             module_entry = LANGUAGE_MODULES.get(language_name)
             if module_entry is None:
                 module_name = ""
@@ -79,23 +107,50 @@ class CodeParser:
                 )
 
             self._language_cache[language_name] = Language(language_fn())
-        return self._language_cache[language_name]
+            return self._language_cache[language_name]
 
     def _get_parser(self, language_name: str):
-        if language_name not in self._parser_cache:
+        """
+        Return a Parser for the specified language that is private to the current thread.
+
+        Tree-sitter's Parser holds mutable C-level state for its incremental parse buffers. 
+        Sharing a single Parser across ThreadPoolExecutor workers causes state corruption.
+
+        By storing parsers in threading.local(), each worker thread lazily creates 
+        its own set of Parser instances.
+        """
+        # Each thread has its own parser dictionary stored inside self._thread_local.
+        thread_parsers: dict = getattr(self._thread_local, "_parsers", None)
+        if thread_parsers is None:
+            thread_parsers = {}
+            self._thread_local._parsers = thread_parsers
+
+        if language_name not in thread_parsers:
             parser = Parser()
             language = self._get_language(language_name)
             if hasattr(parser, "set_language"):
                 parser.set_language(language)
             else:
                 parser.language = language
-            self._parser_cache[language_name] = parser
-        return self._parser_cache[language_name]
+            thread_parsers[language_name] = parser
+        return thread_parsers[language_name]
 
     def _query_captures(self, language: Language, query_scm: str, root_node):
         if not query_scm.strip():
             return []
-        query = Query(language, query_scm)
+
+        # Query objects are read-only after compilation and can be shared.
+        # Since two threads might try to compile the same query simultaneously,
+        # the cache-miss path is protected with a lock.
+        cache_key = f"{id(language)}:{hash(query_scm)}"
+        query = self._query_cache.get(cache_key)
+        if query is None:
+            with self._query_lock:
+                query = self._query_cache.get(cache_key)
+                if query is None:
+                    query = Query(language, query_scm)
+                    self._query_cache[cache_key] = query
+
         cursor = QueryCursor(query)
         captures: list[tuple[object, str]] = []
         for _pattern_index, match_captures in cursor.matches(root_node):
@@ -105,11 +160,11 @@ class CodeParser:
         return captures
 
     def _load_query(self, language_name: str) -> str:
-        """Loads a .scm query file from the queries directory."""
+        """Load a .scm query file from the queries directory."""
         query_path = self.query_dir / f"{language_name}.scm"
         if not query_path.exists():
             return ""
-        # FIX: added explicit encoding="utf-8" to avoid platform-dependent decoding issues
+        # Explicit encoding is added to avoid platform-dependent decoding issues.
         return query_path.read_text(encoding="utf-8")
 
     def language_for_file(self, file_path: str) -> Optional[str]:
@@ -119,7 +174,7 @@ class CodeParser:
         return None
 
     def iter_supported_files(self, files: Iterable[str]) -> Iterator[tuple[str, str]]:
-        # FIX: added missing space after colon in type annotation
+        # Added missing space in type annotation
         for file_path in files:
             language_name = self.language_for_file(file_path)
             if language_name:
@@ -139,22 +194,18 @@ class CodeParser:
         return "class" if any(hint in lowered for hint in class_hints) else "function"
 
     def _is_symbol_capture(self, capture_name: str) -> bool:
-        return capture_name.endswith(".name")
+        # Explicitly exclude call.name — it ends with '.name' but is a call capture.
+        return capture_name.endswith(".name") and not capture_name.startswith("call.")
 
     def _is_call_capture(self, capture_name: str) -> bool:
         return capture_name == "call.name" or capture_name.endswith(".call")
 
     def extract_symbols_and_calls(self, code: str, language_name: Optional[str] = None):
         """
-        Bridge between raw code text and the relation graph.
-        1. Used to get what is defined in the code.
-        2. And where is it used / called?
+        Acts as a bridge between the raw code text and the relation graph.
+        Used to determine what is defined in the code and where it is called.
 
-        Converts:
-            Raw source code  →  Structured relationships
-
-        Returns:
-            symbols & calls
+        Converts raw source code into structured relationships and returns symbols and calls.
         """
         language_name = language_name or self.default_language_name
         parser = self._get_parser(language_name)
@@ -171,7 +222,7 @@ class CodeParser:
         captures = self._query_captures(language, query_scm, tree.root_node)
 
         for node, capture_name in captures:
-            # SYMBOL EXTRACTION
+            # Extract symbols
             if self._is_symbol_capture(capture_name):
                 definition_node = node.parent or node
                 symbol_type = self._symbol_type_from_capture(capture_name, definition_node.type)
@@ -192,11 +243,11 @@ class CodeParser:
                     "byte_range": (definition_node.start_byte, definition_node.end_byte)
                 })
 
-            # CALL RELATION EXTRACTION
+            # Extract call relations
             elif self._is_call_capture(capture_name):
                 callee = node.text.decode("utf8")
 
-                # Find WHICH function this call lives inside
+                # Find which function this call belongs to
                 caller = resolve_enclosing_function(node, source_bytes, language_name=language_name)
 
                 if caller:
