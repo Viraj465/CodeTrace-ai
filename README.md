@@ -42,8 +42,10 @@ The biggest addition yet. A completely new, interactive HTML architecture map ge
 ### 🌍 Multi-Language Parser Expansion (11+ Languages)
 Codetrace now parses C#, Swift, Kotlin, Bash, HTML, JSON, CSS, YAML, SQL, TOML, and Dockerfiles in addition to the original Python, JS, TS, Java, C++, Go, Rust, and PHP.
 
-### 📄 MIT Licensed
-Codetrace AI is now open-source. Contributions, bug reports, and feature requests are welcome. If you build something with or inspired by Codetrace, we'd love to hear about it — please credit the original project.
+### ⚡ 2x Faster Ollama Integration
+Local Ollama models connected with Codetrace-AI works 2x faster than before due to the optimization made in the code and **Call Graph** it initally takes time to load the model but after that it works 2x faster than before as now it use single model for the whole session.
+
+*Codetrace AI is open-source. Contributions, bug reports, and feature requests are welcome. If you build something with or inspired by Codetrace, we'd love to hear about it — please credit the original project.*
 
 ---
 
