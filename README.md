@@ -4,7 +4,8 @@
 
 <p align="center">
   <a href="https://pypi.org/project/codetrace-ai/"><img src="https://img.shields.io/pypi/v/codetrace-ai?color=orange&label=PyPI&logo=pypi&logoColor=white" alt="PyPI Version"/></a>
-  <a href="https://pypi.org/project/codetrace-ai/"><img src="https://img.shields.io/pypi/dm/codetrace-ai?color=blue&label=Downloads" alt="Downloads"/></a>
+  <a href="https://pepy.tech/projects/codetrace-ai"><img src="https://static.pepy.tech/badge/codetrace-ai" alt="Total Downloads"/></a>
+  <a href="https://pepy.tech/projects/codetrace-ai"><img src="https://static.pepy.tech/badge/codetrace-ai/month" alt="Monthly Downloads"/></a>
   <a href="https://github.com/Viraj465/CodeTrace-ai/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License"/></a>
   <a href="https://github.com/Viraj465/CodeTrace-ai/stargazers"><img src="https://img.shields.io/github/stars/Viraj465/CodeTrace-ai?style=social" alt="GitHub Stars"/></a>
   <a href="https://github.com/Viraj465/CodeTrace-ai/pulls"><img src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg" alt="PRs Welcome"/></a>
