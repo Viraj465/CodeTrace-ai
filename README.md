@@ -28,7 +28,7 @@
 </p>
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Viraj465/CodeTrace-ai/main/Images/demo.gif" alt="CodeTrace answering 'What breaks if I change Signer.get_signature?' on pallets/itsdangerous with a local qwen3.5:4b model" width="900"/>
+  <img src="Images/demo.gif" alt="CodeTrace answering 'What breaks if I change Signer.get_signature?' on pallets/itsdangerous with a local qwen3.5:4b model" width="900"/>
   <br/>
   <sub>Real session, shown at 2× speed: blast-radius question on <a href="https://github.com/pallets/itsdangerous">pallets/itsdangerous</a>, answered by <code>qwen3.5:4b</code> via Ollama on a 6 GB laptop GPU. Nothing left the machine.</sub>
 </p>
