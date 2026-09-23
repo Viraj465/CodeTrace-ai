@@ -1,5 +1,8 @@
 # Environments
 .env
+.env.*
+!.env.example
+.venv/
 venv/
 env/
 ENV/
@@ -24,11 +27,12 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+# Anchored: a bare `lib/` would also hide any source folder named lib
+/lib/
+/lib64/
 parts/
 sdist/
-var/
+/var/
 wheels/
 share/python-wheels/
 *.egg-info/
@@ -48,5 +52,16 @@ MANIFEST
 .DS_Store
 *.zip
 idea.md
-benchmarks/
+benchmarkIDX/
 website-next/
+feature-files.md
+.claude
+.kiro
+
+planning
+
+# Local tooling / scratch
+.kilo/
+.cursor/
+.mcp.json
+*.cast

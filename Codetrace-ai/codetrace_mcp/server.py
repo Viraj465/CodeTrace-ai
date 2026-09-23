@@ -2,7 +2,7 @@
 Codetrace MCP Server: Exposes codebase analysis tools to AI-powered IDEs
 (Cursor, VS Code, Claude Desktop, Windsurf, etc.) via the Model Context Protocol.
 
-Reuses the same core logic as the CLI agent — zero duplicated code.
+It leans on the exact same core logic as the CLI agent — nothing is duplicated.
 
 Usage:
     python codetrace_mcp/server.py                          # stdio (for IDE integration)
@@ -16,7 +16,7 @@ import argparse
 from pathlib import Path
 from typing import Optional
 
-# Silence HF logs (same as CLI)
+# Quiet the HuggingFace logs, same as the CLI does.
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"]        = "error"
 os.environ["TOKENIZERS_PARALLELISM"]        = "false"
@@ -24,14 +24,19 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+try:
+    from mcp.server.fastmcp import FastMCP as MCPServer
+except ImportError:
+    from mcp.server import MCPServer
 
-# server.py is an entry-point script that lives outside the src/ package.
-# It is launched with the project root on sys.path (via pyproject.toml scripts or
-# direct invocation), so absolute 'src.*' imports are intentional and correct here.
-# Do NOT convert these to relative imports — relative imports only work inside a package.
+# This file is an entry-point script, not part of the src/ package. It runs with
+# the project root on sys.path (from the pyproject scripts entry or direct
+# invocation), so the absolute 'src.*' imports below are deliberate. Don't switch
+# them to relative imports — those only work from inside a package.
+_project_root = str(Path(__file__).resolve().parent.parent)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 from src.core.agents.tools import (
     search_codebase_impl,
     inspect_index_impl,
@@ -47,209 +52,122 @@ from src.core.graph.builder import CodeGraph
 logger = logging.getLogger("codetrace.mcp")
 
 
-# Globals (initialized once on server startup)
+# Set once at startup and reused for the life of the server.
 vector_store: Optional[VectorStore] = None
 graph: Optional[CodeGraph] = None
 
-# MCP Server Definition
-app = Server("codetrace")
+# The MCP server itself.
+app = MCPServer("codetrace")
 
 
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    """Advertise available tools to the connected IDE."""
-    return [
-        Tool(
-            name="search_codebase",
-            description=(
-                "Search the indexed codebase for code symbols semantically "
-                "related to the query. Returns matching code snippets with "
-                "file paths and symbol names."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Natural language search query",
-                    }
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="inspect_index",
-            description=(
-                "Inspect index DB coverage and list indexed files. "
-                "Use before architecture analysis to confirm available evidence."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Optional substring filter for file paths",
-                        "default": "",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "description": "Max file paths to return (default 50)",
-                        "default": 50,
-                    },
-                },
-            },
-        ),
-        Tool(
-            name="get_symbol_relations",
-            description=(
-                "Get structural relationships of a code symbol: what calls it "
-                "and what it depends on. Symbol ID format: 'filepath:qualified_name'."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol_id": {
-                        "type": "string",
-                        "description": "Symbol ID in 'filepath:name' format",
-                    }
-                },
-                "required": ["symbol_id"],
-            },
-        ),
-        Tool(
-            name="read_file",
-            description=(
-                "Read the full contents of a source file by path. "
-                "Use when you need imports, constants, or full file context."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the source file",
-                    },
-                    "max_lines": {
-                        "type": "integer",
-                        "description": "Max lines to return (default 200)",
-                        "default": 200,
-                    },
-                },
-                "required": ["file_path"],
-            },
-        ),
-        Tool(
-            name="analyze_impact",
-            description=(
-                "Find all downstream dependents of a symbol — the blast radius "
-                "if this symbol changes. Returns affected symbols by depth."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol_id": {
-                        "type": "string",
-                        "description": "Symbol ID in 'filepath:name' format",
-                    }
-                },
-                "required": ["symbol_id"],
-            },
-        ),
-        Tool(
-            name="write_file",
-            description=(
-                "Write content to a file, creating it if needed or overwriting. "
-                "Use for bug fixes, refactoring, or generating new files."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Path to the file to write",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "Complete file content to write",
-                    },
-                },
-                "required": ["file_path", "content"],
-            },
-        ),
-        Tool(
-            name="git_diff",
-            description=(
-                "Show git diff for the project. Use for PR reviews or "
-                "understanding recent changes."
-            ),
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "description": "Diff target: 'HEAD', '--staged', 'HEAD~1', or branch name",
-                        "default": "HEAD",
-                    }
-                },
-            },
-        ),
-    ]
-
-
-@app.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    """Route MCP tool calls to shared core logic."""
+@app.tool(
+    description=(
+        "Search the indexed codebase for code symbols semantically "
+        "related to the query. Returns matching code snippets with "
+        "file paths and symbol names."
+    )
+)
+def search_codebase(query: str) -> str:
+    """Search the indexed codebase for code symbols semantically related to the query."""
     if vector_store is None or graph is None:
-        return [TextContent(
-            type="text",
-            text="Error: Codetrace server not initialized. Index a project first.",
-        )]
+        return "Error: Codetrace server not initialized. Index a project first."
+    return search_codebase_impl(vector_store, query)
 
-    if name == "search_codebase":
-        result = search_codebase_impl(vector_store, arguments["query"])
 
-    elif name == "inspect_index":
-        result = inspect_index_impl(
-            arguments.get("query", ""),
-            arguments.get("limit", 50),
-        )
+@app.tool(
+    description=(
+        "Inspect index DB coverage and list indexed files. "
+        "Use before architecture analysis to confirm available evidence."
+    )
+)
+def inspect_index(query: str = "", limit: int = 50) -> str:
+    """Inspect index DB coverage and list indexed files."""
+    if vector_store is None or graph is None:
+        return "Error: Codetrace server not initialized. Index a project first."
+    return inspect_index_impl(query=query, limit=limit)
 
-    elif name == "get_symbol_relations":
-        result = get_symbol_relations_impl(graph, arguments["symbol_id"])
 
-    elif name == "read_file":
-        result = read_file_impl(
-            arguments["file_path"],
-            arguments.get("max_lines", 200),
-        )
+@app.tool(
+    description=(
+        "Get structural relationships of a code symbol: what calls it "
+        "and what it depends on. Symbol ID format: 'filepath:qualified_name'."
+    )
+)
+def get_symbol_relations(symbol_id: str) -> str:
+    """Get structural relationships of a code symbol: what calls it and what it depends on."""
+    if vector_store is None or graph is None:
+        return "Error: Codetrace server not initialized. Index a project first."
+    return get_symbol_relations_impl(graph, symbol_id)
 
-    elif name == "analyze_impact":
-        result = analyze_impact_impl(graph, arguments["symbol_id"])
 
-    elif name == "write_file":
-        result = write_file_impl(
-            arguments["file_path"], 
-            arguments["content"], 
-            project_root=str(Path.cwd().resolve())
-        )
+@app.tool(
+    description=(
+        "Read the full contents of a source file by path. "
+        "Use when you need imports, constants, or full file context."
+    )
+)
+def read_file(file_path: str, max_lines: int = 200) -> str:
+    """Read the full contents of a source file by path."""
+    if vector_store is None or graph is None:
+        return "Error: Codetrace server not initialized. Index a project first."
+    return read_file_impl(file_path, max_lines)
 
-    elif name == "git_diff":
-        result = git_diff_impl(".", arguments.get("target", "HEAD"))
 
-    else:
-        result = f"Unknown tool: {name}"
+@app.tool(
+    description=(
+        "Find all downstream dependents of a symbol — the blast radius "
+        "if this symbol changes. Returns affected symbols by depth."
+    )
+)
+def analyze_impact(symbol_id: str) -> str:
+    """Find all downstream dependents of a symbol (blast radius)."""
+    if vector_store is None or graph is None:
+        return "Error: Codetrace server not initialized. Index a project first."
+    return analyze_impact_impl(graph, symbol_id)
 
-    return [TextContent(type="text", text=result)]
+
+@app.tool(
+    description=(
+        "Write content to a file, creating it if needed or overwriting. "
+        "Use for bug fixes, refactoring, or generating new files."
+    )
+)
+def write_file(file_path: str, content: str) -> str:
+    """Write content to a file, creating it if needed or overwriting."""
+    if vector_store is None or graph is None:
+        return "Error: Codetrace server not initialized. Index a project first."
+    return write_file_impl(
+        file_path,
+        content,
+        project_root=str(Path.cwd().resolve()),
+    )
+
+
+@app.tool(
+    description=(
+        "Show git diff for the project. Use for PR reviews or "
+        "understanding recent changes."
+    )
+)
+def git_diff(target: str = "HEAD") -> str:
+    """Show git diff for the project."""
+    if vector_store is None or graph is None:
+        return "Error: Codetrace server not initialized. Index a project first."
+    return git_diff_impl(target)
+
 
 def _init_stores(project_path: str) -> None:
     """Load VectorStore and CodeGraph from an indexed project."""
     global vector_store, graph
 
-    db_dir = Path(project_path).resolve() / ".codetrace"
+    resolved_path = Path(project_path).resolve()
+    db_dir = resolved_path / ".codetrace"
     if not db_dir.exists():
         logger.error("No .codetrace directory found at %s", db_dir)
         logger.error("Run 'codetrace index .' on the project first.")
         sys.exit(1)
+
+    os.chdir(resolved_path)
 
     logger.info("Loading Codetrace stores from: %s", db_dir)
 
@@ -268,14 +186,10 @@ def _init_stores(project_path: str) -> None:
 async def main(project_path: str = ".") -> None:
     """Run the Codetrace MCP server over stdio."""
     _init_stores(project_path)
-
-    async with stdio_server() as (read_stream, write_stream):
-        await app.run(read_stream, write_stream, app.create_initialization_options())
+    await app.run_stdio_async()
 
 
 if __name__ == "__main__":
-    import asyncio
-
     parser = argparse.ArgumentParser(description="Codetrace MCP Server")
     parser.add_argument(
         "--project", "-p",
@@ -284,4 +198,5 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    import asyncio
     asyncio.run(main(args.project))

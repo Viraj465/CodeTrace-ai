@@ -13,9 +13,9 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-# No LangChain dependency — tool schemas are defined as plain dicts below.
+# No LangChain here — the tool schemas further down are just plain dicts.
 
-# Use relative imports to ensure IDEs resolve them correctly and avoid missing-import errors.
+# Relative imports so IDEs resolve them correctly and don't flag missing imports.
 from ..graph.builder import CodeGraph
 from ...backend.vector_store import VectorStore
 from ..database.sync_manager import SyncManager
@@ -50,13 +50,40 @@ def search_codebase_impl(vector_store: VectorStore, query: str) -> str:
     return "\n".join(blocks)
 
 
+def _resolve_symbol_or_error(graph: CodeGraph, symbol_id: str) -> tuple[str | None, str | None]:
+    """
+    Resolve a supplied symbol ID to one stored node ID.
+    Returns (node_id, None) on success, or (None, message) when the ID is
+    unknown or ambiguous so the tool can tell the model exactly what to retry.
+    """
+    matches = graph.resolve_symbol_id(symbol_id)
+    if len(matches) == 1:
+        return matches[0], None
+    if not matches:
+        return None, (
+            f"Symbol '{symbol_id}' not found in the graph. Use the "
+            "'filepath:qualified_name' form (e.g. 'src/app.py:Service.run'), "
+            "or search_codebase to find the exact symbol."
+        )
+    shown = "\n".join(f"  - {m}" for m in matches[:15])
+    more = f"\n  - ... and {len(matches) - 15} more" if len(matches) > 15 else ""
+    return None, (
+        f"Symbol '{symbol_id}' is ambiguous — {len(matches)} matches. "
+        f"Retry with one of these IDs:\n{shown}{more}"
+    )
+
+
 def get_symbol_relations_impl(graph: CodeGraph, symbol_id: str) -> str:
     """Get structural relationships (callers + dependencies) of a symbol."""
+    symbol_id, error = _resolve_symbol_or_error(graph, symbol_id)
+    if error:
+        return error
+
     callers      = graph.get_callers(symbol_id)
     dependencies = graph.get_dependencies(symbol_id)
 
     if not callers and not dependencies:
-        return f"Symbol '{symbol_id}' not found in the graph, or it has no relationships."
+        return f"Symbol '{symbol_id}' is in the graph but has no callers or dependencies."
 
     lines = [f"Relations for: {symbol_id}\n"]
     if callers:
@@ -84,10 +111,19 @@ def read_file_impl(file_path: str, max_lines: int = 200) -> str:
         if not p.is_absolute():
             p = Path.cwd() / file_path
         root = Path.cwd().resolve()
-        if not str(p.resolve()).startswith(str(root)):
+        resolved = p.resolve()
+        # Use is_relative_to (not str.startswith) so a sibling dir like
+        # 'project-secret' can't pass the check for root 'project'.
+        if not resolved.is_relative_to(root):
             return f"Blocked: cannot read outside project root ({root})"
 
-        snap = sync.get_file_snapshot(file_path)
+        # Look the snapshot up by the SAME validated path used by the check
+        # above — not the raw input. Snapshots are keyed by absolute path at
+        # index time, so try that exact key first, then the project-relative
+        # path (which get_file_snapshot matches on a directory boundary).
+        snap = sync.get_file_snapshot(str(resolved)) or sync.get_file_snapshot(
+            str(resolved.relative_to(root))
+        )
     except Exception as e:
         return f"Error reading snapshot DB: {e}"
 
@@ -98,13 +134,16 @@ def read_file_impl(file_path: str, max_lines: int = 200) -> str:
         )
 
     lines = snap["content"].splitlines()
-    truncated = len(lines) > max_lines
+    # Two independent truncations, both worth surfacing:
+    #   snapshot_truncated  → the stored snapshot was capped at index time (size limit)
+    #   output_truncated    → this read is capped to max_lines for context budget
+    output_truncated = len(lines) > max_lines
     preview = "\n".join(lines[:max_lines])
     header = f"--- {Path(snap['filepath']).name} ({snap['line_count']} lines, from index DB) ---\n"
     footer_lines = []
     if snap["is_truncated"]:
         footer_lines.append("... (snapshot truncated during indexing due to size limit)")
-    if truncated:
+    if output_truncated:
         footer_lines.append(
             f"... (output truncated, showing first {max_lines} of {len(lines)} lines)"
         )
@@ -175,11 +214,15 @@ def inspect_index_impl(query: str = "", limit: int = 50) -> str:
 
 def analyze_impact_impl(graph: CodeGraph, symbol_id: str) -> str:
     """Find all downstream dependents of a symbol (blast radius)."""
+    symbol_id, error = _resolve_symbol_or_error(graph, symbol_id)
+    if error:
+        return error
+
     dependents = graph.get_all_downstream_dependents(symbol_id)
     if not dependents:
         return (
-            f"No downstream dependents found for '{symbol_id}'. "
-            f"Either the symbol has no callers, or its ID is not in the graph."
+            f"No downstream dependents found for '{symbol_id}' — "
+            f"nothing in the index calls it."
         )
 
     lines = [f"Impact analysis for: {symbol_id}",
@@ -206,7 +249,9 @@ def write_file_impl(file_path: str, content: str, project_root: str | None = Non
     # Block writes outside the project root.
     if project_root:
         root = Path(project_root).resolve()
-        if not str(p.resolve()).startswith(str(root)):
+        # is_relative_to avoids the str.startswith prefix-collision flaw
+        # (e.g. 'project-secret' matching root 'project').
+        if not p.resolve().is_relative_to(root):
             return f"Blocked: cannot write outside project root ({root})"
 
     # Block binary files.
@@ -248,6 +293,13 @@ def propose_write_impl(file_path: str, content: str) -> str:
     p = Path(file_path)
     if not p.is_absolute():
         p = Path.cwd() / file_path
+
+    # Refuse to even propose a write outside the project. The approval prompt is
+    # a second line of defence, not the only one — the model reads repo content
+    # it didn't write, and that content can try to steer it at ~/.bashrc & co.
+    root = Path.cwd().resolve()
+    if not p.resolve().is_relative_to(root):
+        return f"Blocked: cannot write outside project root ({root})"
 
     # Perform safety checks.
     blocked_extensions = {".exe", ".dll", ".so", ".pyc", ".pyo", ".class", ".o"}
@@ -296,28 +348,78 @@ def propose_write_impl(file_path: str, content: str) -> str:
     )
 
 
-def git_diff_impl(path: str = ".", target: str = "HEAD") -> str:
-    """Run git diff and return the output.
+def summarize_file_blast_radius(graph: CodeGraph, file_path: str, max_files: int = 12) -> str:
+    """
+    Given a file about to be edited, list the OTHER files that contain symbols
+    transitively depending on this file's symbols — i.e. the files that may also
+    need coordinated changes.
+
+    Returned as a compact, agent-readable block so the model proposes edits for
+    the whole blast radius in one batch instead of one file at a time.
+    """
+    target = Path(file_path).as_posix().lstrip("./")
+    target_name = Path(file_path).name
+
+    affected: dict[str, int] = {}
+    matched_any = False
+    for node_id, data in graph.direct_graph.nodes(data=True):
+        node_file = data.get("file", "")
+        if not node_file:
+            continue
+        node_posix = Path(node_file).as_posix()
+        # Precise match: same relative path (separator-normalized) or path suffix.
+        if not (node_posix == target or node_posix.endswith(f"/{target}")):
+            continue
+        matched_any = True
+        for dep in graph.get_all_downstream_dependents(node_id):
+            dep_file = dep.get("file")
+            if dep_file and Path(dep_file).as_posix() != node_posix:
+                affected[dep_file] = affected.get(dep_file, 0) + 1
+
+    if not matched_any:
+        # File not indexed as a symbol owner (e.g. brand-new file) — nothing to report.
+        return ""
+    if not affected:
+        return "Blast radius: no downstream dependent files found for this file."
+
+    ranked = sorted(affected.items(), key=lambda kv: (-kv[1], kv[0]))
+    lines = ["Blast radius — dependent files that may also need coordinated edits:"]
+    for f, count in ranked[:max_files]:
+        lines.append(f"  - {f} ({count} dependent symbol(s))")
+    if len(ranked) > max_files:
+        lines.append(f"  - ... and {len(ranked) - max_files} more file(s)")
+    lines.append(
+        "Review each with analyze_impact / get_symbol_relations and, if they "
+        "need changes, propose write_file for them in THIS batch."
+    )
+    return "\n".join(lines)
+
+
+def git_diff_impl(target: str = "HEAD") -> str:
+    """Run git diff on the project (cwd) and return the output.
+
+    Always scoped to the current project directory — there is deliberately no
+    caller- or model-supplied path, so git can't be pointed outside the project.
 
     target can be:
-      - "HEAD"       → unstaged changes
+      - "HEAD"       → all uncommitted changes (staged + unstaged)
       - "--staged"   → staged changes
       - "HEAD~1"     → diff from last commit
       - a branch name → diff against that branch
     """
     try:
-        cmd = ["git", "-C", str(Path(path).resolve()), "diff"]
-        
+        cmd = ["git", "-C", str(Path.cwd().resolve()), "diff"]
+
         # Block malicious flag injections.
         if target != "--staged" and target.startswith("-"):
             return f"Blocked: invalid git diff target '{target}'"
 
-        if target == "--staged":
-            cmd.append("--staged")
-        else:
-            # Prevent Git from interpreting subsequent arguments as flags.
-            cmd.append("--")
-            cmd.append(target)
+        # The revision goes BEFORE "--". Anything after "--" is a pathspec, so
+        # `git diff -- HEAD` would filter to a file named "HEAD" and always come
+        # back empty. The trailing "--" also stops git from guessing whether an
+        # ambiguous target is a path.
+        cmd.append(target)
+        cmd.append("--")
 
         result = subprocess.run(
             cmd,
@@ -345,8 +447,9 @@ def git_diff_impl(path: str = ".", target: str = "HEAD") -> str:
 
 
 
-# OpenAI-Compatible Tool Schemas
-# Replace the LangChain decorators with plain JSON schemas compatible with standard chat completion APIs.
+# OpenAI-compatible tool schemas.
+# These plain JSON schemas stand in for the old LangChain decorators and work
+# with any standard chat-completions API.
 
 
 def create_tool_schemas() -> list[dict]:
@@ -472,13 +575,13 @@ def create_tool_schemas() -> list[dict]:
                 "name": "git_diff",
                 "description": (
                     "Show git diff for the current project. "
-                    "target can be: 'HEAD' (unstaged), '--staged', 'HEAD~1' (last commit), "
+                    "target can be: 'HEAD' (all uncommitted changes), '--staged', 'HEAD~1' (last commit), "
                     "or a branch name to compare against."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "target": {"type": "string", "description": "Diff target (default: 'HEAD'). Options: 'HEAD' (unstaged), '--staged', 'HEAD~1', or a branch name."},
+                        "target": {"type": "string", "description": "Diff target (default: 'HEAD'). Options: 'HEAD' (all uncommitted changes), '--staged', 'HEAD~1', or a branch name."},
                     },
                     "required": [],
                 },
@@ -510,18 +613,29 @@ def dispatch_tool(
     graph: CodeGraph,
 ) -> str:
     """
-    Execute a tool by name with the given arguments.
-    Routes to the corresponding _impl function and returns its string output.
-    This replaces the old LangChain @tool closures — same logic, no framework.
+    Run a tool by name, routing to its _impl function and returning the string
+    it produces. Same job the old LangChain @tool closures did, minus the framework.
     """
+    def _propose_write_with_radius() -> str:
+        result = propose_write_impl(tool_args["file_path"], tool_args["content"])
+        # Tack the blast radius onto the result so the model sees the dependent
+        # files and can propose their edits in the same turn instead of one by one.
+        try:
+            radius = summarize_file_blast_radius(graph, tool_args["file_path"])
+            if radius:
+                result = f"{result}\n\n{radius}"
+        except Exception:
+            pass
+        return result
+
     dispatchers = {
         "search_codebase":      lambda: search_codebase_impl(vector_store, tool_args["query"]),
         "get_symbol_relations": lambda: get_symbol_relations_impl(graph, tool_args["symbol_id"]),
         "read_file":            lambda: read_file_impl(tool_args["file_path"], tool_args.get("max_lines", 200)),
         "inspect_index":        lambda: inspect_index_impl(tool_args.get("query", ""), tool_args.get("limit", 50)),
         "analyze_impact":       lambda: analyze_impact_impl(graph, tool_args["symbol_id"]),
-        "write_file":           lambda: propose_write_impl(tool_args["file_path"], tool_args["content"]),
-        "git_diff":             lambda: git_diff_impl(".", tool_args.get("target", "HEAD")),
+        "write_file":           _propose_write_with_radius,
+        "git_diff":             lambda: git_diff_impl(tool_args.get("target", "HEAD")),
     }
 
     dispatcher = dispatchers.get(tool_name)

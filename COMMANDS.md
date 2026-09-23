@@ -119,6 +119,21 @@ codetrace visualize
 
 Opens a browser with an interactive node graph showing functions, classes, and their relationships.
 
+### `codetrace mcp [PATH]`
+
+Start the Model Context Protocol (MCP) server for IDE integration (Cursor, VS Code, Claude Desktop, Windsurf, etc.).
+
+```bash
+codetrace mcp .                         # start MCP server on current directory
+codetrace mcp /path/to/project          # start MCP server on a specific project
+```
+
+The server speaks MCP over **stdio** — your IDE launches it and talks over stdin/stdout, so there is no host or port. Use `codetrace register-mcp [PATH]` to (re)write the IDE config for a project.
+
+### `codetrace set-ctx [TOKENS] [--backoff F]` · `set-default-ctx <TOKENS>` · `set-model-limits`
+
+Context-window controls. `set-ctx` pins the Ollama `num_ctx` (`0` returns to GPU auto-sizing; `--backoff 0.75` shrinks more gently under memory pressure). `set-default-ctx` is the fallback window for cloud models CodeTrace doesn't recognise; `set-model-limits --context-window N --max-output-tokens M` pins both for the configured cloud model.
+
 ---
 
 ## Offline / Local LLM Setup (Air-Gapped)
@@ -157,7 +172,7 @@ codetrace chat --offline
 
 ## IDE Integration (MCP)
 
-`codetrace init` auto-registers MCP for **Cursor** and **Claude Code**.
+`codetrace init` auto-registers MCP for **Claude Code**, **Cursor** and **VS Code** (per-project `.mcp.json`, `.cursor/mcp.json`, `.vscode/mcp.json`).
 
 After running `init`, your IDE will automatically see these tools:
 - `search_codebase` — semantic code search

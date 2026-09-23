@@ -4,10 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codetrace-ai"
-version = "1.0.1"
-description = "Autonomous AI CLI for interactive architecture visualization, call-graph mapping, and hybrid codebase intelligence."
+version = "1.0.3"
+description = "Governed, local-first code intelligence for AI agents: call graphs, blast radius, cited answers, MCP server — any LLM, including Ollama"
 readme = "README.md"
-requires-python = ">=3.10"
+# torch==2.5.1 has no Windows/macOS wheels for 3.13+, so cap here rather than
+# let pip fail deep inside dependency resolution.
+requires-python = ">=3.10,<3.13"
 license = {text = "MIT"}
 authors = [
     {name = "Viraj Sawant", email = "sawantviraj465@gmail.com"}
@@ -47,6 +49,7 @@ dependencies = [
     "tree-sitter-java",
     "tree-sitter-go",
     "tree-sitter-c",
+    "litellm",
     "tree-sitter-cpp",
     "tree-sitter-rust",
     "tree-sitter-php",
@@ -71,6 +74,9 @@ dependencies = [
     "nest-asyncio>=1.6.0",
     "flashrank>=0.2.10",
     "mcp>=1.26.0",
+    # Memory reporting. system_info falls back to per-platform stdlib probes
+    # without it, but psutil is the accurate cross-platform source.
+    "psutil>=5.9",
     # Alt-parser dependencies (YAML, TOML, SQL, Dockerfile)
     "pyyaml>=6.0",
     "sqlglot>=25.0.0",
@@ -78,10 +84,10 @@ dependencies = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/Viraj465/codetrace-ai"
-"Repository" = "https://github.com/Viraj465/codetrace-ai"
-"Bug Tracker" = "https://github.com/Viraj465/codetrace-ai/issues"
-"Changelog" = "https://github.com/Viraj465/codetrace-ai/releases"
+"Homepage" = "https://codetraceai.in"
+"Repository" = "https://github.com/Viraj465/CodeTrace-ai"
+"Bug Tracker" = "https://github.com/Viraj465/CodeTrace-ai/issues"
+"Changelog" = "https://github.com/Viraj465/CodeTrace-ai/releases"
 
 [project.optional-dependencies]
 dev = [
@@ -99,6 +105,9 @@ codetrace = "src.cli.main:app"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["src*", "codetrace_mcp*"]
+
+[tool.setuptools.package-data]
+"src" = ["core/parser/queries/*.scm"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

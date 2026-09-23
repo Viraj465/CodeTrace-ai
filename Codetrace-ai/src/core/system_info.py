@@ -73,7 +73,12 @@ class SystemInfo:
             f"  [bold]OS[/bold]       [cyan]{self.os_name}[/cyan] {self.os_version}  [dim]{self.arch}[/dim]",
             f"  [bold]Compute[/bold]  [green]{self.embed_device_label}[/green]"
             + (f"  [dim]{self.gpu_name}[/dim]" if self.gpu_name else ""),
-            f"  [bold]RAM[/bold]      {self.ram_available_gb:.1f} GB free / {self.ram_total_gb:.1f} GB total",
+            f"  [bold]RAM[/bold]      "
+            + (
+                f"{self.ram_available_gb:.1f} GB free / {self.ram_total_gb:.1f} GB total"
+                if self.ram_total_gb > 0
+                else "[dim]unavailable[/dim]"
+            ),
             f"  [bold]CPU[/bold]      {self.cpu_cores} logical cores",
             f"  [bold]Python[/bold]   {self.python_version}",
         ]
@@ -142,15 +147,79 @@ def _get_apple_chip() -> str:
 
 
 def _detect_ram() -> tuple[float, float]:
-    """Returns (total_gb, available_gb). Falls back to (0, 0) if psutil missing."""
+    """
+    Returns (total_gb, available_gb).
+
+    psutil is the good path, but it isn't a hard dependency — without a fallback
+    we reported "0.0 GB free / 0.0 GB total", which is both wrong on screen and
+    useless to the callers that want to know whether there's room to load a model.
+    So each platform gets a stdlib probe before we give up.
+    """
     try:
         import psutil
         vm = psutil.virtual_memory()
-        total = vm.total / (1024 ** 3)
-        available = vm.available / (1024 ** 3)
-        return round(total, 2), round(available, 2)
+        return round(vm.total / (1024 ** 3), 2), round(vm.available / (1024 ** 3), 2)
     except ImportError:
-        return 0.0, 0.0
+        pass
+
+    gib = 1024 ** 3
+    system = platform.system()
+
+    if system == "Windows":
+        # GlobalMemoryStatusEx — always present, no extra install.
+        try:
+            import ctypes
+
+            class _MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = _MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return round(stat.ullTotalPhys / gib, 2), round(stat.ullAvailPhys / gib, 2)
+        except Exception:
+            pass
+
+    elif system == "Linux":
+        try:
+            fields = {}
+            with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+                for line in fh:
+                    key, _, rest = line.partition(":")
+                    parts = rest.split()
+                    if parts and parts[0].isdigit():
+                        fields[key] = int(parts[0]) * 1024  # kB → bytes
+            total = fields.get("MemTotal", 0)
+            # MemAvailable is the honest number; fall back to free + cache.
+            avail = fields.get("MemAvailable") or (
+                fields.get("MemFree", 0) + fields.get("Cached", 0)
+            )
+            if total:
+                return round(total / gib, 2), round(avail / gib, 2)
+        except Exception:
+            pass
+
+    else:  # macOS / BSD
+        try:
+            total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            # No cheap "available" equivalent here; report total for both rather
+            # than claiming zero free.
+            return round(total / gib, 2), round(total / gib, 2)
+        except Exception:
+            pass
+
+    logger.debug("Could not determine RAM on this platform.")
+    return 0.0, 0.0
 
 
 def _detect_unicode_terminal() -> bool:

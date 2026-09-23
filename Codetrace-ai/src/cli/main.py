@@ -8,29 +8,29 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Windows: Force UTF-8 so Rich Unicode renders correctly in PowerShell or Windows Terminal.
-# Two layers are required:
-#   1. SetConsoleOutputCP(65001) sets the Win32 console code page to UTF-8.
-#   2. sys.stdout.reconfigure() makes Python's stream write UTF-8 bytes.
+# Getting Rich's Unicode to render in PowerShell / Windows Terminal takes three
+# separate nudges — the console code page, Python's own streams, and Rich itself
+# all have to agree on UTF-8, and fixing one without the others still garbles output.
 if sys.platform == "win32":
-    # Layer 1: Set Win32 console code page to UTF-8
+    # Flip the Win32 console code page to UTF-8.
     try:
         import ctypes
         ctypes.windll.kernel32.SetConsoleOutputCP(65001)
         ctypes.windll.kernel32.SetConsoleCP(65001)
     except Exception:
         pass
-    # Layer 2: Reconfigure Python streams
+    # Make Python's own stdout/stderr write UTF-8 bytes.
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except AttributeError:
-        pass  # Fallback for Python versions below 3.7.
-    # Layer 3: Disable Rich's LegacyWindowsTerm renderer.
-    # Rich defaults to using _win32_console.py on older Windows consoles, which
-    # bypasses the UTF-8 fixes. Setting RICH_LEGACY_WINDOWS=0 forces the standard ANSI path.
+        pass  # reconfigure() didn't exist before 3.7.
+    # Keep Rich off its LegacyWindowsTerm path. On older consoles Rich falls back
+    # to _win32_console.py, which sidesteps everything above; RICH_LEGACY_WINDOWS=0
+    # pins it to the normal ANSI renderer.
     os.environ.setdefault("RICH_LEGACY_WINDOWS", "0")
 
 import typer
@@ -83,6 +83,7 @@ from src.cli.config_helpers import (
 from src.cli.project_helpers import (
     clone_repo as _clone_repo,
     get_project_root as _get_project_root,
+    repo_cache_dir as _repo_cache_dir,
     parse_github_url as _parse_github_url,
 )
 from src.cli.ui_helpers import (
@@ -101,11 +102,12 @@ from src.core.database.sync_manager import SyncManager
 from src.core.graph.builder import CodeGraph
 from src.core.graph.orchestrator import GraphOrchestrator
 from src.core.system_info import get_system_info
-from src.ignore import ALWAYS_IGNORE_DIRS, _is_always_ignored
+from src.config_io import write_private_json
+from src.ignore import ALWAYS_IGNORE_DIRS, _is_always_ignored, _is_always_ignored_file
 
 logger = logging.getLogger(__name__)
 
-# Silence verbose weight-loading logs from HuggingFace and Transformers.
+# Quiet down HuggingFace/Transformers weight-loading chatter.
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -114,7 +116,7 @@ logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("sentence_transformers").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
-# Silence httpx HTTP request logs and FlashRank progress bars.
+# ...and httpx request logs plus FlashRank's progress bars.
 logging.getLogger("httpx").setLevel(logging.ERROR)
 logging.getLogger("httpcore").setLevel(logging.ERROR)
 logging.getLogger("flashrank").setLevel(logging.ERROR)
@@ -132,7 +134,7 @@ app = typer.Typer(
     add_completion=False,
 )
 
-# Set legacy_windows=False to prevent Rich from using the Win32 LegacyWindowsTerm renderer, which causes Unicode garbling.
+# legacy_windows=False for the same reason as above: keep Rich off the renderer that garbles Unicode.
 console = Console(legacy_windows=False)
 
 
@@ -161,6 +163,39 @@ def print_system_info() -> None:
     )
 
 
+def _resolve_mcp_server_path(target_dir: Path) -> Path:
+    """
+    Locate the MCP server inside the *installed package*.
+
+    It must not be derived from the project being indexed: target_dir only holds
+    a codetrace_mcp/ directory when that project happens to be the Codetrace
+    source tree itself, so every pip-installed user got a path that doesn't exist.
+
+    codetrace_mcp ships without an __init__.py, which makes it a namespace
+    package — those report ``origin is None`` and carry the directory in
+    ``submodule_search_locations`` instead, so both shapes are handled here.
+    """
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("codetrace_mcp")
+    except (ImportError, ValueError):
+        spec = None
+
+    if spec:
+        if spec.origin:
+            candidate = Path(spec.origin).parent / "server.py"
+            if candidate.is_file():
+                return candidate
+        for location in spec.submodule_search_locations or []:
+            candidate = Path(location) / "server.py"
+            if candidate.is_file():
+                return candidate
+
+    # Last resort: the layout that shipped before this was fixed.
+    return target_dir / "codetrace_mcp" / "server.py"
+
+
 def get_project_root(path: str) -> Path:
     return _get_project_root(path, console)
 
@@ -174,17 +209,20 @@ def _run_setup_wizard(config_path: Path, is_reconfigure: bool = False) -> None:
 
 def collect_source_files(root: Path) -> list[Path]:
     """
-    Walk through the directory and collect all source code files,
-    while respecting .gitignore rules AND the hardcoded ALWAYS_IGNORE_DIRS.
+    Collect every source file under ``root``, honoring both .gitignore and the
+    hardcoded ALWAYS_IGNORE_DIRS.
 
-    Uses os.walk with in-place directory pruning so we never descend into
-    node_modules/, venv/, __pycache__/, etc. \u2014 avoiding enumerating 20k+ files.
+    We prune ignored dirs in-place during the os.walk so we never step into
+    node_modules/, venv/, __pycache__/ and friends \u2014 on a big repo that's the
+    difference between touching a few hundred files and enumerating 20k+.
     """
     all_files = []
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune always-ignored dirs IN-PLACE so os.walk never enters them.
+        # Drop ignored dirs in-place so os.walk won't recurse into them.
         dirnames[:] = [d for d in dirnames if not _is_always_ignored(d)]
         for filename in filenames:
+            if _is_always_ignored_file(filename):
+                continue
             all_files.append(Path(dirpath) / filename)
 
     graph = CodeGraph()
@@ -222,7 +260,7 @@ def chat(
     except Exception:
         pass
 
-    # Trigger the interactive setup if config is missing
+    # No config yet? Kick off the setup wizard.
     ensure_config()
 
     if offline:
@@ -239,7 +277,7 @@ def chat(
                 )
 
     with console.status("[bold cyan]Waking up the Architect (loading Graph & Vectors)...", spinner="point"):
-        # Load the databases.
+        # Open the vector store and graph DB.
         vs_config = VectorStoreConfig(persist_dir=str(db_dir / "chroma"))
         vector_store = VectorStore(config=vs_config)
 
@@ -248,17 +286,26 @@ def chat(
         graph._init_db()
         graph.load_from_db()
 
-        # Initialize the httpx-powered Agent.
+        # Spin up the agent (uses httpx under the hood).
         try:
             agent = AgentOrchestrator(vector_store, graph)
         except ValueError as e:
-            # Catch errors from the retriever if the API key is invalid.
+            # The retriever raises ValueError when the API key is bad/missing.
             console.print(f"[red]Configuration Error: {e}[/red]")
             raise typer.Exit(1)
 
     console.print("[bold green]Architect is online! Type 'exit' or 'quit' to stop.[/bold green]")
 
-    # Initialize ChatStore
+    # For Ollama, show the context window in use (it adapts as the session runs —
+    # watch for the ℹ notices when it auto-lowers under memory pressure).
+    if getattr(agent, "_is_ollama", False):
+        console.print(
+            f"[dim]Ollama context window: {agent._ollama_num_ctx:,} tokens "
+            f"({getattr(agent, '_ollama_ctx_source', 'auto')}). "
+            f"Change with 'codetrace set-ctx'.[/dim]"
+        )
+
+    # Chat history lives in its own SQLite DB.
     chat_store = ChatStore(db_dir / "chat_history.db")
 
     if resume and chat_store.session_exists(resume):
@@ -273,12 +320,10 @@ def chat(
 
     console.print("-" * 60)
 
-    # 4. The Continuous Chat Loop
+    # Main chat loop — runs until the user exits.
     while True:
-        # Prompt the user for a question.
         query = Prompt.ask("\n[bold cyan]You[/bold cyan]")
 
-        # Allow the user to exit the loop.
         if query.strip().lower() in ["exit", "quit"]:
             chat_store.close()
             console.print("[bold magenta]Shutting down Architect. Goodbye![/bold magenta]")
@@ -292,7 +337,7 @@ def chat(
         if not query.strip():
             continue
 
-        # Guardrail: Catch accidental API key pastes.
+        # Catch someone pasting their API key into the prompt by mistake.
         if looks_like_api_key(query):
             console.print(
                 "[bold yellow]⚠  That looks like an API key, not a question![/bold yellow]\n"
@@ -301,9 +346,9 @@ def chat(
             )
             continue
 
-        # Execute the agentic pipeline.
+        # Run the agent.
         try:
-            # Tool label mapping (ASCII-safe).
+            # Friendly, ASCII-safe labels for each tool the agent might call.
             tool_labels = {
                 "search_codebase":      "Searching codebase",
                 "inspect_index":        "Inspecting index",
@@ -314,87 +359,205 @@ def chat(
                 "git_diff":             "Running git diff",
             }
 
-            streaming_started = False
+            # On an Ollama out-of-memory the agent stops the turn, lowers num_ctx,
+            # and emits a "memory_limit" event — we then ask whether to retry the
+            # same question with the smaller window. Everything else runs once.
             full_response = ""
-            live = None
-            # Transient status spinner shown while a tool is executing.
-            # Stopped and erased when the tool finishes or streaming begins.
-            _tool_status = None
+            memory_stopped = False
 
-            for event in agent.stream(query, chat_history=chat_store.get_history_for_llm(session_id)):
-                evt_type = event["type"]
+            while True:
+                streaming_started = False
+                full_response = ""
+                live = None
+                # Spinner shown while a tool runs; we stop and erase it once the
+                # tool finishes or the model starts streaming its answer.
+                _tool_status = None
+                # Spinner tailing a thinking model's reasoning, plus the buffer it
+                # renders from. Both reset per attempt.
+                _reasoning_status = None
+                _reasoning_buf = ""
+                memory_event = None
 
-                if evt_type == "thought":
-                    # Show a transient spinner for the current tool; it will be erased automatically.
-                    if _tool_status:
-                        _tool_status.stop()
-                    tool_name = event.get("tool", "")
-                    label = tool_labels.get(tool_name, "Working")
-                    # Append the tool argument detail from the event message.
-                    detail = event.get("message", "")
-                    # Provide context detail from the tool message.
-                    _tool_status = console.status(
-                        f"[dim]{detail}[/dim]",
-                        spinner="dots",
-                    )
-                    _tool_status.start()
+                for event in agent.stream(query, chat_history=chat_store.get_history_for_llm(session_id)):
+                    evt_type = event["type"]
 
-                elif evt_type == "tool_end":
-                    # Erase the spinner without leaving a permanent line.
-                    if _tool_status:
-                        _tool_status.stop()
-                        _tool_status = None
+                    if evt_type == "thought":
+                        # Swap in a fresh spinner for whatever tool is now running.
+                        if _tool_status:
+                            _tool_status.stop()
+                        # Reasoning ended the moment a tool call was decided.
+                        if _reasoning_status:
+                            _reasoning_status.stop()
+                            _reasoning_status = None
+                            _reasoning_buf = ""
+                        tool_name = event.get("tool", "")
+                        label = tool_labels.get(tool_name, "Working")
+                        # The event message carries the tool's argument detail.
+                        detail = event.get("message", "")
+                        _tool_status = console.status(
+                            f"[dim]{detail}[/dim]",
+                            spinner="dots",
+                        )
+                        _tool_status.start()
 
-                elif evt_type == "token":
-                    token_text = event.get("content", "")
-                    if not isinstance(token_text, str):
-                        token_text = str(token_text)
-                    if not token_text:
-                        continue
+                    elif evt_type == "tool_end":
+                        # Tool's done — clear the spinner so it leaves no trace.
+                        if _tool_status:
+                            _tool_status.stop()
+                            _tool_status = None
+                        if _reasoning_status:
+                            _reasoning_status.stop()
+                            _reasoning_status = None
+                            _reasoning_buf = ""
 
-                    # Stop any lingering tool spinner before streaming begins.
-                    if _tool_status:
-                        _tool_status.stop()
-                        _tool_status = None
+                    elif evt_type == "reasoning":
+                        # Thinking models emit reasoning before any answer token.
+                        # Show a live tail of it: without this the terminal sits
+                        # blank for the whole reasoning phase, which on a local
+                        # model can be a minute or more and reads as a freeze.
+                        chunk = event.get("content", "")
+                        if not isinstance(chunk, str) or not chunk:
+                            continue
+                        _reasoning_buf += chunk
+                        if _tool_status:
+                            _tool_status.stop()
+                            _tool_status = None
+                        if _reasoning_status is None:
+                            _reasoning_status = console.status("", spinner="dots")
+                            _reasoning_status.start()
+                        # Last line, trimmed — a rolling window, not a transcript.
+                        tail = " ".join(_reasoning_buf.split())[-90:]
+                        _reasoning_status.update(f"[dim italic]thinking… {tail}[/dim italic]")
 
-                    if not streaming_started:
-                        console.print("\n[bold dark_orange]Architect:[/bold dark_orange]")
-                        streaming_started = True
-                        live = Live(Markdown(""), console=console, refresh_per_second=10)
-                        live.start()
-                    full_response += token_text
-                    live.update(Markdown(full_response))
+                    elif evt_type == "token":
+                        token_text = event.get("content", "")
+                        if not isinstance(token_text, str):
+                            token_text = str(token_text)
+                        if not token_text:
+                            continue
 
-                elif evt_type == "done":
-                    if _tool_status:
-                        _tool_status.stop()
-                        _tool_status = None
-                    if live:
-                        live.stop()
-                    if not streaming_started and not full_response:
-                        # The agent finished without streaming tokens.
-                        pass
+                        # Reasoning is over once real content arrives.
+                        if _reasoning_status:
+                            _reasoning_status.stop()
+                            _reasoning_status = None
+                            _reasoning_buf = ""
 
-                elif evt_type == "error":
-                    # Surface async producer exceptions (API errors, auth failures, etc.)
-                    if _tool_status:
-                        _tool_status.stop()
-                        _tool_status = None
-                    if live:
-                        live.stop()
-                        live = None
-                    err_msg = event.get("message", "Unknown error")
-                    console.print(f"\n[bold red]Architect Error:[/bold red] {err_msg}")
-                    break
+                        # Kill any leftover tool spinner before streaming text.
+                        if _tool_status:
+                            _tool_status.stop()
+                            _tool_status = None
 
-                elif evt_type == "usage":
-                    # Token counter (this is the only persistent tool-activity line).
-                    turn_usage = event.get("turn")
-                    if turn_usage:
-                        console.print(turn_usage.format())
+                        if not streaming_started:
+                            console.print("\n[bold dark_orange]Architect:[/bold dark_orange]")
+                            streaming_started = True
+                            live = Live(Markdown(""), console=console, refresh_per_second=10)
+                            live.start()
+                        full_response += token_text
+                        live.update(Markdown(full_response))
 
-            # Process pending writes (human-in-the-loop).
-            # This runs once per turn, after all events have been processed.
+                    elif evt_type == "notice":
+                        # Informational retune (e.g. auto-lowered num_ctx). Print
+                        # once, out of the way.
+                        if _tool_status:
+                            _tool_status.stop()
+                            _tool_status = None
+                        if _reasoning_status:
+                            _reasoning_status.stop()
+                            _reasoning_status = None
+                        console.print(f"[dim]ℹ {event.get('message', '')}[/dim]")
+
+                    elif evt_type == "memory_limit":
+                        # Hard OOM: the turn was stopped and num_ctx lowered. Note
+                        # it and break out to ask whether to retry.
+                        if _tool_status:
+                            _tool_status.stop()
+                            _tool_status = None
+                        if _reasoning_status:
+                            _reasoning_status.stop()
+                            _reasoning_status = None
+                        if live:
+                            live.stop()
+                            live = None
+                        memory_event = event
+                        console.print(
+                            f"\n[bold yellow]⚠ {event.get('message', '')}[/bold yellow]"
+                        )
+                        break
+
+                    elif evt_type == "done":
+                        if _tool_status:
+                            _tool_status.stop()
+                            _tool_status = None
+                        if _reasoning_status:
+                            _reasoning_status.stop()
+                            _reasoning_status = None
+                        if live:
+                            live.stop()
+                        if not streaming_started and not full_response:
+                            # Agent wrapped up without emitting any tokens.
+                            pass
+
+                    elif evt_type == "error":
+                        # Something blew up in the async producer (API error, auth, …).
+                        if _tool_status:
+                            _tool_status.stop()
+                            _tool_status = None
+                        if _reasoning_status:
+                            _reasoning_status.stop()
+                            _reasoning_status = None
+                        if live:
+                            live.stop()
+                            live = None
+                        # Some exceptions carry an empty message and some carry a
+                        # multi-line one (onnxruntime allocation dumps, provider
+                        # stack traces). Empty printed as a bare "Architect
+                        # Error:" with nothing after it; multi-line smeared
+                        # across the spinner. Normalize both.
+                        err_msg = " ".join(
+                            str(event.get("message") or "").split()
+                        ) or "Unknown error (no detail reported)"
+                        console.print(f"\n[bold red]Architect Error:[/bold red] {err_msg}")
+                        break
+
+                    elif evt_type == "usage":
+                        # The token counter — the one line we leave on screen.
+                        turn_usage = event.get("turn")
+                        if turn_usage:
+                            console.print(turn_usage.format())
+                    
+                    elif evt_type == "normalized":
+                        # Replace the raw accumulated text with the normalized
+                        # version once streaming is complete. live may be None if
+                        # no content tokens ever streamed (empty answer).
+                        full_response = event.get("content", "")
+                        if live:
+                            live.update(Markdown(full_response))
+
+                if memory_event is None:
+                    break  # normal completion — no retry needed
+
+                choice = Prompt.ask(
+                    "[yellow]Continue this question with the smaller context window?[/yellow]",
+                    choices=["y", "n"],
+                    default="y",
+                )
+                if choice.lower() == "y":
+                    console.print("[dim]Retrying with the reduced window…[/dim]")
+                    continue
+
+                # User declined — drop any half-formed proposed edits and skip
+                # persisting this incomplete turn.
+                memory_stopped = True
+                clear_pending_writes()
+                console.print(
+                    "[dim]Stopped. The context window stays reduced for the rest "
+                    "of the session (raise it with 'codetrace set-ctx').[/dim]"
+                )
+                break
+
+            # Now deal with any file changes the agent proposed this turn. Nothing
+            # gets written without the user approving it first (once per turn, after
+            # all events are in).
             pending_writes = get_pending_writes()
             if pending_writes:
                 batches = _group_pending_writes_by_root_dir(pending_writes)
@@ -417,7 +580,11 @@ def chat(
                     for pw in batch_items:
                         approved = _show_diff_panel(console, pw)
                         if approved:
-                            result = write_file_impl(pw["file_path"], pw["content"])
+                            result = write_file_impl(
+                                pw["file_path"],
+                                pw["content"],
+                                project_root=str(Path.cwd().resolve()),
+                            )
                             if result.startswith("Successfully wrote"):
                                 batch_changed += 1
                                 console.print(f"  [bold green]✓ {result}[/bold green]")
@@ -465,15 +632,22 @@ def chat(
 
             console.print("-" * 60)
 
-            # Save messages to chat history.
-            chat_store.add_message(session_id, "user", query)
-            if full_response:
-                chat_store.add_message(session_id, "assistant", full_response)
+            # Persist this turn to history — unless it was aborted at an OOM stop,
+            # in which case the turn never completed and shouldn't be saved.
+            if not memory_stopped:
+                chat_store.add_message(session_id, "user", query)
+                if full_response:
+                    chat_store.add_message(session_id, "assistant", full_response)
 
         except Exception as e:
             if _tool_status:
                 try:
                     _tool_status.stop()
+                except Exception:
+                    pass
+            if _reasoning_status:
+                try:
+                    _reasoning_status.stop()
                 except Exception:
                     pass
             if live:
@@ -520,14 +694,19 @@ def init(
     if config_path.exists():
         console.print("  [green]✓ Config already exists – skipping[/green]")
     else:
-        if llm:
-            # Non-interactive: Auto-configure with defaults.
+        if llm and llm.lower() == "custom":
+            # A custom endpoint needs a base URL and wire format that no flag can
+            # supply, so send it through the wizard rather than writing a config
+            # that would fail on first use.
+            console.print("  [dim]Custom provider needs an endpoint — starting setup.[/dim]\n")
+            _run_setup_wizard(config_path, is_reconfigure=False)
+        elif llm:
+            # --llm was passed, so skip the wizard and write a default config.
             config_data = {"provider": llm.lower(), "api_key": "", "model_name": "", "base_url": ""}
             if llm.lower() != "ollama":
                 api_key = Prompt.ask(f"  [cyan]Enter your {llm.upper()} API Key[/cyan]", password=True)
                 config_data["api_key"] = api_key
-            with open(config_path, "w") as f:
-                json.dump(config_data, f, indent=4)
+            write_private_json(config_path, config_data)
             console.print(f"  [green]✓ Configured with {llm}[/green]")
         else:
             _run_setup_wizard(config_path, is_reconfigure=False)
@@ -572,26 +751,34 @@ def init(
         orchestrator.graph._init_db()
         orchestrator.graph.load_from_db()
 
-    # Discover files using os.walk with in-place pruning.
-    # ALWAYS_IGNORE_DIRS are pruned from the walk to avoid enumerating ignored contents.
-    # filter_paths then applies all .gitignore rules.
+    # Walk the tree, pruning ALWAYS_IGNORE_DIRS as we go so we never enumerate
+    # their contents. filter_paths() applies the .gitignore rules afterward.
     _raw_files = []
     for dirpath, dirnames, filenames in os.walk(target_dir):
         dirnames[:] = [d for d in dirnames if not _is_always_ignored(d)]
         for fn in filenames:
+            if _is_always_ignored_file(fn):
+                continue
             _raw_files.append(Path(dirpath) / fn)
     _raw_files = orchestrator.graph.filter_paths(_raw_files, repo_root=target_dir)
     all_files = [str(p) for p in _raw_files]
-    supported_files = [f for f, _ in orchestrator.parser.iter_supported_files(all_files)]
+    supported_files = [f for f, _ in orchestrator.iter_supported_files(all_files)]
     supported_set = set(supported_files)
 
     changed_all_file_pairs = sync_manager.get_changed_files(all_files)
     deleted_files = sync_manager.get_deleted_files(all_files)
 
     if deleted_files:
+        # Deleted files are gone from disk, so they're never in supported_set;
+        # decide whether they were indexed from the path alone.
+        _deleted_supported = [
+            df for df, _ in orchestrator.iter_supported_files(deleted_files)
+        ]
+        if _deleted_supported:
+            orchestrator.graph.prune_files(_deleted_supported)
+            if vector_store:
+                vector_store.delete_by_file(_deleted_supported)
         for df in deleted_files:
-            if df in supported_set:
-                orchestrator.graph.prune_files([df])
             sync_manager.remove_file_record(df)
             sync_manager.remove_file_snapshot(df)
 
@@ -610,6 +797,17 @@ def init(
 
     if changed_supported_file_pairs:
         start_time = time.time()
+
+        # Wipe the old graph nodes/edges and vectors for each changed file first,
+        # otherwise symbols that got renamed or deleted inside a file would stick
+        # around (for brand-new files this is a no-op). Has to happen before we
+        # parse and before we seed the lookup maps below.
+        _changed_supported_files = [fp for fp, _ in changed_supported_file_pairs]
+        if vector_store:
+            vector_store.delete_by_file(_changed_supported_files)
+        # Calls INTO these files from unchanged files get deleted with them;
+        # keep them so they can be restored once the files are re-parsed.
+        _inbound_edges = orchestrator.graph.prune_files(_changed_supported_files)
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -621,13 +819,14 @@ def init(
                 total=len(changed_supported_file_pairs)
             )
 
-            # Parse all changed files in parallel.
+            # Parse every changed file in parallel.
             MAX_WORKERS = max(4, os.cpu_count() or 4)
             all_symbols = []
             all_calls = []
             all_vs_ids = []
             all_vs_contents = []
             all_vs_metadatas = []
+            _failed_files: set[str] = set()
 
             def _parse_one(file_path: str) -> dict:
                 return orchestrator.extract_from_file(file_path)
@@ -648,46 +847,35 @@ def init(
                         progress.advance(task)
                     except Exception as e:
                         logger.error("Failed to parse %s: %s", fp, e)
+                        _failed_files.add(fp)
 
-            # Batch build the graph.
-            name_to_id: dict[str, str] = {}
-            qualified_to_id: dict[str, str] = {}
-            nodes_batch = []
-            edges_batch = []
-
-            for file_path, s in all_symbols:
-                qualified_name = s.get("qualified_name") or s["name"]
-                symbol_id = f"{file_path}:{qualified_name}"
-                nodes_batch.append((symbol_id, s["type"], file_path))
-                name_to_id[s["name"]] = symbol_id
-                qualified_to_id[qualified_name] = symbol_id
-
-            for file_path, c in all_calls:
-                caller_id = f"{file_path}:{c['caller']}"
-                callee_id = qualified_to_id.get(c["callee"]) or name_to_id.get(c["callee"])
-                if not callee_id:
-                    candidates = [
-                        sid for qn, sid in qualified_to_id.items()
-                        if qn.endswith(f".{c['callee']}")
-                    ]
-                    if len(candidates) == 1:
-                        callee_id = candidates[0]
-                edges_batch.append((caller_id, callee_id or c["callee"]))
-
+            # Build the graph in one batch. Callees resolve against this batch
+            # plus the unchanged files already in the graph (see build_batch).
+            nodes_batch, edges_batch = orchestrator.build_batch(all_symbols, all_calls)
             orchestrator.graph.add_nodes_batch(nodes_batch)
             orchestrator.graph.add_edges_batch(edges_batch)
+            orchestrator.graph.restore_inbound_edges(_inbound_edges)
 
             if vector_store and all_vs_ids:
                 vector_store.add_symbols_batch(all_vs_ids, all_vs_contents, all_vs_metadatas)
 
         orchestrator.graph.persist_to_db()
-        sync_manager.mark_files_synced_batch(changed_all_file_pairs)
+        # Leave files that failed to parse unsynced so the next run retries
+        # them, instead of silently treating them as indexed with no symbols.
+        sync_manager.mark_files_synced_batch(
+            [(fp, h) for fp, h in changed_all_file_pairs if fp not in _failed_files]
+        )
         sync_manager.update_index_manifest(
             target_dir,
             sync_manager.get_all_tracked_file_hashes(),
             supported_file_count=len(supported_files),
         )
         elapsed = time.time() - start_time
+        if _failed_files:
+            console.print(
+                f"[yellow]⚠ {len(_failed_files)} file(s) could not be parsed and will be "
+                f"retried on the next index run (see the log for details).[/yellow]"
+            )
         console.print(f"  [green]✓ Indexed {len(supported_files)} files in {elapsed:.2f}s[/green]")
     else:
         if changed_all_file_pairs:
@@ -709,7 +897,21 @@ def init(
 
     # Step 4: Register MCP.
     console.print("[bold cyan]Step 4/4[/bold cyan] – Registering MCP for IDEs")
-    mcp_results = _register_mcp(target_dir)
+    
+    # Resolve the server from the *installed package*, not the project being
+    # indexed — target_dir only contains codetrace_mcp/ when the project happens
+    # to be the CodeTrace source tree itself, so deriving the path from it wrote
+    # a file:// that doesn't exist for every pip-installed user. sys.executable
+    # keeps the IDE on the same interpreter codetrace is installed into.
+    server_path = _resolve_mcp_server_path(target_dir)
+
+    servers_config = {
+        "codetrace": {
+            "command": sys.executable,
+            "args": [str(server_path), "--project", str(target_dir)],
+        }
+    }
+    mcp_results = _register_mcp(servers_config, workspace_dir=target_dir)
     for msg in mcp_results:
         console.print(f"  {msg}")
     console.print()
@@ -718,11 +920,32 @@ def init(
     console.print(Panel(
         f"[bold green]✅ Codetrace is ready![/bold green]\n\n"
         f"  Indexed:  [bold]{target_dir}[/bold]\n"
-        f"  MCP:      registered for Cursor + Claude Code\n\n"
+        f"  MCP:      registered for Claude Code, Cursor + VS Code (project config)\n\n"
         f"  [dim]Try:[/dim] [cyan]codetrace chat[/cyan]",
         title="Setup Complete",
         border_style="green"
     ))
+
+@app.command(name="register-mcp", help="Register MCP server with IDEs (Cursor, Claude Code, VS Code).")
+def register_mcp(
+    path: str = typer.Argument(".", help="Path to the indexed project"),
+):
+    """Register the Codetrace MCP server with all supported IDEs."""
+    target_dir = get_project_root(path)
+    server_path = _resolve_mcp_server_path(target_dir)
+
+    servers_config = {
+        "codetrace": {
+            "command": sys.executable,
+            "args": [str(server_path), "--project", str(target_dir)],
+        }
+    }
+    mcp_results = _register_mcp(servers_config, workspace_dir=target_dir)
+    for msg in mcp_results:
+        console.print(f"  {msg}")
+    console.print()
+
+
 
 @app.command()
 def index(path: str = typer.Argument(".", help="Target directory or GitHub URL to index")):
@@ -737,21 +960,29 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
     print_banner()
     print_system_info()
 
-    # Detect remote repo URL vs local path.
+    # Is this a remote repo URL or a local path?
     cloned_dir = None
     repo_info = _parse_github_url(path)
 
     if repo_info:
-        console.print(f"\n[bold blue]Cloning remote repository...[/bold blue]")
+        # Keep the checkout (and the index inside it) in a stable location so
+        # `codetrace chat` can be run against it afterwards, and so indexing the
+        # same URL again is an incremental update rather than a fresh clone.
+        repo_dir = _repo_cache_dir(repo_info["clone_url"], repo_info["branch"])
+        updating = (repo_dir / ".git").exists()
+        action = "Updating" if updating else "Cloning"
+        console.print(f"\n[bold blue]{action} remote repository...[/bold blue]")
         console.print(f"  URL:    [dim]{repo_info['clone_url']}[/dim]")
         if repo_info["branch"]:
             console.print(f"  Branch: [dim]{repo_info['branch']}[/dim]")
         console.print()
 
         try:
-            with console.status("[bold cyan]Running git clone --depth 1...", spinner="dots"):
-                cloned_dir = _clone_repo(repo_info["clone_url"], repo_info["branch"])
-            console.print(f"  [green]\u2713 Cloned to:[/green] [dim]{cloned_dir}[/dim]\n")
+            status = "Fetching latest commit..." if updating else "Running git clone --depth 1..."
+            with console.status(f"[bold cyan]{status}", spinner="dots"):
+                cloned_dir = _clone_repo(repo_info["clone_url"], repo_info["branch"], dest=repo_dir)
+            verb = "Updated" if updating else "Cloned to"
+            console.print(f"  [green]\u2713 {verb}:[/green] [dim]{cloned_dir}[/dim]\n")
         except RuntimeError as e:
             console.print(f"[bold red]Clone failed:[/bold red] {e}")
             raise typer.Exit(1)
@@ -762,7 +993,7 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
 
     db_dir = target_dir / ".codetrace"
 
-    # Auto-initialize if necessary, especially for cloned repositories.
+    # Set up the .codetrace dir on the fly — mostly matters for fresh clones.
     if not db_dir.exists():
         db_dir.mkdir(parents=True, exist_ok=True)
         SyncManager(db_dir=str(db_dir))
@@ -770,7 +1001,7 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
     console.print(f"[bold blue]Starting Codetrace Indexer[/bold blue] \U0001f680")
     console.print(f"Target: [dim]{target_dir}[/dim]\n")
 
-    # 1. Initialize databases and models.
+    # Bring up the databases and embedding models.
     with console.status("[bold cyan]Waking up Vector Models and DB connections...", spinner="point"):
         sync_manager = SyncManager(db_dir=str(db_dir))
         orchestrator = GraphOrchestrator()
@@ -782,24 +1013,25 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
         orchestrator.graph._init_db()
         orchestrator.graph.load_from_db()
 
-    # 2. Discover files
-    # Discover files using os.walk with in-place pruning.
-    # ALWAYS_IGNORE_DIRS are pruned from the walk to avoid enumerating ignored contents.
-    # filter_paths then applies all .gitignore rules.
+    # Find the files to index.
+    # Walk the tree, pruning ALWAYS_IGNORE_DIRS as we go so we never enumerate
+    # their contents. filter_paths() applies the .gitignore rules afterward.
     _raw_files = []
     for dirpath, dirnames, filenames in os.walk(target_dir):
         dirnames[:] = [d for d in dirnames if not _is_always_ignored(d)]
         for fn in filenames:
+            if _is_always_ignored_file(fn):
+                continue
             _raw_files.append(Path(dirpath) / fn)
     _raw_files = orchestrator.graph.filter_paths(_raw_files, repo_root=target_dir)
     all_files = [str(p) for p in _raw_files]
-    supported_files = [f for f, _ in orchestrator.parser.iter_supported_files(all_files)]
+    supported_files = [f for f, _ in orchestrator.iter_supported_files(all_files)]
     supported_set = set(supported_files)
 
     if not supported_files:
         console.print("[yellow]No supported code files found in this directory.[/yellow]")
 
-    # 3. Calculate Deltas (What changed?)
+    # Figure out what actually changed since the last index.
     changed_all_file_pairs = sync_manager.get_changed_files(all_files)
     changed_supported_file_pairs = [
         (file_path, file_hash)
@@ -816,15 +1048,22 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
         )
         console.print("[bold green]\u2713 Codebase is fully up to date![/bold green]")
         if cloned_dir:
-            shutil.rmtree(cloned_dir, ignore_errors=True)
+            _print_remote_chat_hint(cloned_dir)
         return
 
-    # 4. Handle Deletions (Pruning)
+    # Drop anything that was deleted from disk.
     if deleted_files:
         with console.status(f"[bold red]Pruning {len(deleted_files)} deleted files..."):
+            # Deleted files are gone from disk, so they're never in supported_set;
+            # decide whether they were indexed from the path alone.
+            _deleted_supported = [
+                df for df, _ in orchestrator.iter_supported_files(deleted_files)
+            ]
+            if _deleted_supported:
+                orchestrator.graph.prune_files(_deleted_supported)
+                if vector_store:
+                    vector_store.delete_by_file(_deleted_supported)
             for df in deleted_files:
-                if df in supported_set:
-                    orchestrator.graph.prune_files([df])
                 sync_manager.remove_file_record(df)
                 sync_manager.remove_file_snapshot(df)
 
@@ -833,9 +1072,20 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
             for file_path, file_hash in changed_all_file_pairs:
                 sync_manager.upsert_file_snapshot_from_disk(file_path, file_hash=file_hash)
 
-    # 5. Ingestion Loop (Parsing & Embedding)
+    # Parse and embed everything that changed.
     if changed_supported_file_pairs:
         start_time = time.time()
+
+        # Wipe the old graph nodes/edges and vectors for each changed file first,
+        # otherwise symbols that got renamed or deleted inside a file would stick
+        # around (for brand-new files this is a no-op). Has to happen before we
+        # parse and before we seed the lookup maps below.
+        _changed_supported_files = [fp for fp, _ in changed_supported_file_pairs]
+        if vector_store:
+            vector_store.delete_by_file(_changed_supported_files)
+        # Calls INTO these files from unchanged files get deleted with them;
+        # keep them so they can be restored once the files are re-parsed.
+        _inbound_edges = orchestrator.graph.prune_files(_changed_supported_files)
 
         with Progress(
             SpinnerColumn(),
@@ -848,13 +1098,14 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
                 total=len(changed_supported_file_pairs)
             )
 
-            # Parse all changed files in parallel.
+            # Parse every changed file in parallel.
             MAX_WORKERS = max(4, os.cpu_count() or 4)
             all_symbols = []
             all_calls = []
             all_vs_ids = []
             all_vs_contents = []
             all_vs_metadatas = []
+            _failed_files: set[str] = set()
 
             def _parse_one(file_path: str) -> dict:
                 return orchestrator.extract_from_file(file_path)
@@ -875,42 +1126,26 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
                         progress.advance(task)
                     except Exception as e:
                         logger.error("Failed to parse %s: %s", fp, e)
+                        _failed_files.add(fp)
 
-            # Batch build the graph.
-            name_to_id: dict[str, str] = {}
-            qualified_to_id: dict[str, str] = {}
-            nodes_batch = []
-            edges_batch = []
-
-            for file_path, s in all_symbols:
-                qualified_name = s.get("qualified_name") or s["name"]
-                symbol_id = f"{file_path}:{qualified_name}"
-                nodes_batch.append((symbol_id, s["type"], file_path))
-                name_to_id[s["name"]] = symbol_id
-                qualified_to_id[qualified_name] = symbol_id
-
-            for file_path, c in all_calls:
-                caller_id = f"{file_path}:{c['caller']}"
-                callee_id = qualified_to_id.get(c["callee"]) or name_to_id.get(c["callee"])
-                if not callee_id:
-                    candidates = [
-                        sid for qn, sid in qualified_to_id.items()
-                        if qn.endswith(f".{c['callee']}")
-                    ]
-                    if len(candidates) == 1:
-                        callee_id = candidates[0]
-                edges_batch.append((caller_id, callee_id or c["callee"]))
-
+            # Build the graph in one batch. Callees resolve against this batch
+            # plus the unchanged files already in the graph (see build_batch).
+            nodes_batch, edges_batch = orchestrator.build_batch(all_symbols, all_calls)
             orchestrator.graph.add_nodes_batch(nodes_batch)
             orchestrator.graph.add_edges_batch(edges_batch)
+            orchestrator.graph.restore_inbound_edges(_inbound_edges)
 
             if vector_store and all_vs_ids:
                 vector_store.add_symbols_batch(all_vs_ids, all_vs_contents, all_vs_metadatas)
 
-        # 6. Save State.
+        # Flush the graph and sync state to disk.
         with console.status("[bold magenta]Persisting Graph and Sync states..."):
             orchestrator.graph.persist_to_db()
-            sync_manager.mark_files_synced_batch(changed_all_file_pairs)
+            # Leave files that failed to parse unsynced so the next run retries
+            # them, instead of silently treating them as indexed with no symbols.
+            sync_manager.mark_files_synced_batch(
+                [(fp, h) for fp, h in changed_all_file_pairs if fp not in _failed_files]
+            )
             sync_manager.update_index_manifest(
                 target_dir,
                 sync_manager.get_all_tracked_file_hashes(),
@@ -918,6 +1153,11 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
             )
 
         elapsed = time.time() - start_time
+        if _failed_files:
+            console.print(
+                f"[yellow]⚠ {len(_failed_files)} file(s) could not be parsed and will be "
+                f"retried on the next index run (see the log for details).[/yellow]"
+            )
         console.print(f"\n[bold green]\u2713 Indexing complete in {elapsed:.2f}s![/bold green]")
     else:
         if changed_all_file_pairs:
@@ -930,11 +1170,16 @@ def index(path: str = typer.Argument(".", help="Target directory or GitHub URL t
         if changed_all_file_pairs:
             console.print("\n[bold green]\u2713 Snapshot update complete (no supported code deltas).[/bold green]")
 
-    # 7. Cleanup cloned repository.
     if cloned_dir:
-        console.print(f"\n[dim]Cloned repo cleaned up. Index stored at: {db_dir}[/dim]")
-        # Note: we keep the .codetrace dir within the temp clone for now.
-        # Future: move it to a persistent location.
+        _print_remote_chat_hint(cloned_dir)
+
+
+def _print_remote_chat_hint(repo_dir: Path) -> None:
+    """Tell the user where an indexed remote repo lives and how to query it."""
+    console.print(
+        f"\n[dim]Repository and index kept at:[/dim] [bold]{repo_dir}[/bold]\n"
+        f"[dim]To ask about it:[/dim] [cyan]cd \"{repo_dir}\" && codetrace chat[/cyan]"
+    )
 
 @app.command()
 def config():
@@ -952,19 +1197,36 @@ def config():
         _run_setup_wizard(config_path, is_reconfigure=False)
         return
 
-    # Show current configuration with masked key.
+    # Print what's configured, keeping the API key masked.
     with open(config_path) as f:
         cfg = json.load(f)
 
-    console.print(Panel(
+    summary = (
         f"[bold]Provider:[/bold]  {cfg.get('provider', 'N/A')}\n"
         f"[bold]API Key:[/bold]   {mask_key(cfg.get('api_key', ''))}\n"
-        f"[bold]Model:[/bold]     {cfg.get('model_name') or '(default)'}",
+        f"[bold]Model:[/bold]     {cfg.get('model_name') or '(default)'}"
+    )
+    # The endpoint and wire format are what define a custom provider, so they
+    # belong in the summary — otherwise there's no way to tell two apart.
+    if cfg.get("base_url"):
+        summary += f"\n[bold]Endpoint:[/bold]  {cfg['base_url']}"
+    if cfg.get("provider", "").lower() == "custom":
+        summary += f"\n[bold]API Style:[/bold] {cfg.get('api_style', 'openai')}"
+    if cfg.get("provider", "").lower() != "ollama":
+        summary += (
+            f"\n[bold]Context:[/bold]   "
+            f"{cfg.get('context_window', 'auto-detect / fallback')}"
+            f"\n[bold]Max output:[/bold] "
+            f"{cfg.get('max_output_tokens', 'auto-detect')}"
+        )
+
+    console.print(Panel(
+        summary,
         title="Current Configuration",
         border_style="cyan"
     ))
 
-    # Ask for confirmation before overwriting.
+    # Don't clobber the existing config without a yes.
     overwrite = Prompt.ask(
         "\n[yellow]Overwrite this configuration?[/yellow]",
         choices=["y", "n"],
@@ -975,6 +1237,223 @@ def config():
         _run_setup_wizard(config_path, is_reconfigure=True)
     else:
         console.print("[dim]Configuration unchanged.[/dim]")
+
+@app.command(name="set-ctx")
+def set_ctx(
+    tokens: int = typer.Argument(
+        -1,
+        help="Ollama context window (num_ctx) in tokens, e.g. 16384. "
+             "Use 0 to clear the override and return to hardware auto-detection. "
+             "Omit to leave the window unchanged (e.g. when only setting --backoff).",
+    ),
+    backoff: float = typer.Option(
+        None,
+        "--backoff",
+        help="Fraction of the window KEPT each time it auto-lowers under memory "
+             "pressure (0.5 = halve, 0.75 = gentler). Range 0.25–0.9.",
+    ),
+):
+    """
+    Configure the Ollama context window (num_ctx) and its auto-lowering step.
+
+    num_ctx overrides the automatic GPU-memory-based sizing. Larger windows
+    retain more conversation history but reserve more GPU memory — too large can
+    OOM or spill to CPU and slow generation. The back-off controls how gently the
+    window shrinks when CodeTrace detects memory pressure.
+
+    Examples:
+      codetrace set-ctx 16384             # pin the window
+      codetrace set-ctx 0                 # clear → auto-detect
+      codetrace set-ctx --backoff 0.75    # gentler auto-lowering, window unchanged
+    """
+    print_banner()
+
+    config_path = Path.home() / ".codetrace" / "config.json"
+    if not config_path.exists():
+        console.print("[red]No configuration found. Run 'codetrace config' first.[/red]")
+        raise typer.Exit(1)
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    if tokens == -1 and backoff is None:
+        console.print(
+            "[yellow]Nothing to change. Pass a token count and/or --backoff.[/yellow]"
+        )
+        raise typer.Exit(1)
+
+    if cfg.get("provider", "").lower() != "ollama":
+        console.print(
+            "[yellow]Note: these settings only apply to the Ollama provider; "
+            f"your current provider is '{cfg.get('provider', 'N/A')}'.[/yellow]"
+        )
+
+    # num_ctx (only when a value was supplied).
+    if tokens == 0:
+        cfg.pop("ollama_num_ctx", None)
+        console.print(
+            "[green]Cleared manual num_ctx — reverting to hardware auto-detection.[/green]"
+        )
+    elif tokens != -1:
+        if tokens < 2048:
+            console.print("[red]num_ctx must be at least 2048 tokens.[/red]")
+            raise typer.Exit(1)
+        cfg["ollama_num_ctx"] = tokens
+        console.print(f"[green]Ollama num_ctx set to {tokens:,} tokens.[/green]")
+        if tokens >= 65536:
+            console.print(
+                "[dim]Heads up: large windows need substantial GPU memory. "
+                "If Ollama OOMs or slows down, lower this value.[/dim]"
+            )
+
+    # back-off factor.
+    if backoff is not None:
+        if not (0.25 <= backoff <= 0.9):
+            console.print("[red]--backoff must be between 0.25 and 0.9.[/red]")
+            raise typer.Exit(1)
+        cfg["ollama_ctx_backoff"] = backoff
+        console.print(
+            f"[green]Auto-lower back-off set to {backoff:g} "
+            f"(keeps {backoff:.0%} of the window per step).[/green]"
+        )
+
+    write_private_json(config_path, cfg)
+
+
+@app.command(name="set-default-ctx")
+def set_default_ctx(
+    tokens: int = typer.Argument(
+        -1,
+        help="Default context window (in tokens) for cloud models that litellm "
+             "doesn't recognise, e.g. 32000. Use 0 to clear and go back to the "
+             "8K conservative fallback. Omit to just view the current value.",
+    ),
+):
+    """
+    Set the fallback context window for UNRECOGNISED cloud models.
+
+    When a cloud provider's model isn't in litellm's registry (common for
+    custom / self-hosted / brand-new models), CodeTrace normally falls back to
+    a cramped 8K "unknown" tier. This lets you raise that fallback so an
+    unmapped cloud model gets a realistic window instead.
+
+    This ONLY affects cloud providers — never Ollama. Ollama sizes its window
+    from GPU memory (num_ctx), and a large default there would OOM, so the 8K
+    fallback is deliberately kept for Ollama.
+
+    Examples:
+      codetrace set-default-ctx 32000      # unmapped cloud models use 32K
+      codetrace set-default-ctx 0          # clear -> back to 8K fallback
+      codetrace set-default-ctx            # just show the current value
+    """
+    print_banner()
+
+    config_path = Path.home() / ".codetrace" / "config.json"
+    if not config_path.exists():
+        console.print("[red]No configuration found. Run 'codetrace config' first.[/red]")
+        raise typer.Exit(1)
+
+    with open(config_path) as f:
+        cfg = json.load(f)
+
+    current = cfg.get("default_context_window")
+
+    if tokens == -1:
+        if current:
+            console.print(
+                f"[cyan]Current cloud default context window: {current:,} tokens.[/cyan]"
+            )
+        else:
+            console.print(
+                "[cyan]No cloud default set - unmapped cloud models fall back to 8K.[/cyan]"
+            )
+        return
+
+    if tokens == 0:
+        cfg.pop("default_context_window", None)
+        console.print(
+            "[green]Cleared cloud default - unmapped cloud models now fall back to 8K.[/green]"
+        )
+    else:
+        if tokens < 2048:
+            console.print("[red]Default context window must be at least 2048 tokens.[/red]")
+            raise typer.Exit(1)
+        cfg["default_context_window"] = tokens
+        console.print(
+            f"[green]Cloud default context window set to {tokens:,} tokens.[/green]\n"
+            f"[dim]Applies only to cloud models litellm doesn't recognise; "
+            f"Ollama is unaffected.[/dim]"
+        )
+
+    write_private_json(config_path, cfg)
+
+
+@app.command(name="set-model-limits")
+def set_model_limits(
+    context_window: int | None = typer.Option(
+    None,
+    "--context-window",
+    help="Actual maximum context window for the configured cloud model.",
+    ),
+    max_output_tokens: int | None = typer.Option(
+        None,
+        "--max-output-tokens",
+        help="Maximum completion tokens for the configured cloud model.",
+    ),
+):
+    """Set explicit limits for the currently configured cloud model."""
+    config_path = Path.home() / ".codetrace" / "config.json"
+
+    if not config_path.exists():
+        console.print("[red]No configuration found. Run 'codetrace config' first.[/red]")
+        raise typer.Exit(1)
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    if cfg.get("provider", "").lower() == "ollama":
+        console.print(
+            "[red]This command is for cloud models only. "
+            "Use 'codetrace set-ctx' for Ollama.[/red]"
+        )
+        raise typer.Exit(1)
+
+    if context_window is None and max_output_tokens is None:
+        console.print(
+            f"Model: {cfg.get('model_name', 'unknown')}\n"
+            f"Context window: {cfg.get('context_window', 'auto')}\n"
+            f"Max output tokens: {cfg.get('max_output_tokens', 'auto')}"
+        )
+        return
+
+    if context_window is not None:
+        if context_window < 2048:
+            console.print("[red]--context-window must be at least 2048.[/red]")
+            raise typer.Exit(1)
+        cfg["context_window"] = context_window
+
+    if max_output_tokens is not None:
+        if max_output_tokens < 128:
+            console.print("[red]--max-output-tokens must be at least 128.[/red]")
+            raise typer.Exit(1)
+
+        effective_window = context_window or cfg.get("context_window")
+        if isinstance(effective_window, int) and max_output_tokens >= effective_window:
+            console.print(
+                "[red]--max-output-tokens must be smaller than the context window.[/red]"
+            )
+            raise typer.Exit(1)
+
+        cfg["max_output_tokens"] = max_output_tokens
+
+    write_private_json(config_path, cfg)
+
+    console.print(
+        f"[green]Saved limits for {cfg.get('model_name', 'configured model')}:[/green]\n"
+        f"  Context window: {cfg.get('context_window', 'auto')}\n"
+        f"  Max output:    {cfg.get('max_output_tokens', 'auto')}"
+    )
+
 
 @app.command()
 def visualize(path: str = typer.Argument(".", help="Target directory")):
@@ -1036,16 +1515,16 @@ def visualize(path: str = typer.Argument(".", help="Target directory")):
 
 def _build_viz_data(graph: "CodeGraph", target_dir: Path) -> dict:
     """
-    Extract folder-level architecture data from the CodeGraph.
+    Pull folder-level architecture data out of the CodeGraph.
 
-    Groups all symbols by their parent folder (relative to project root),
-    then aggregates cross-folder call edges with the actual function names
-    so the visualization can show both the high-level architecture and the
-    specific function-to-function connections.
+    We bucket every symbol under its parent folder (relative to the project root),
+    then roll up the cross-folder call edges — carrying the real function names
+    along — so the visualization can show both the big-picture layout and the
+    individual function-to-function calls behind each edge.
     """
     resolved_root = target_dir.resolve()
 
-    # Pass 1: Group nodes by file and folder.
+    # First pass: group nodes by file and folder.
     files_map: dict[str, dict] = {}   # relative_path -> {folder, name, symbols}
     folders_map: dict[str, dict] = {} # folder_id -> {files, types}
 
@@ -1055,37 +1534,37 @@ def _build_viz_data(graph: "CodeGraph", target_dir: Path) -> dict:
         if not n_file:
             continue
 
-        # Make path relative and normalize separators.
+        # Make the path relative and use forward slashes everywhere.
         try:
             rel_path = str(Path(n_file).resolve().relative_to(resolved_root))
         except ValueError:
             rel_path = Path(n_file).name
         rel_path = rel_path.replace("\\", "/")
 
-        # Determine folder.
+        # Split off the folder.
         parts = rel_path.rsplit("/", 1)
         if len(parts) == 2:
             folder, file_name = parts
         else:
             folder, file_name = "(root)", parts[0]
 
-        # Extract symbol name from the node_id.
+        # The symbol name is the tail of the node_id (after the last ':').
         symbol_name = node_id.rsplit(":", 1)[-1] if ":" in node_id else node_id
 
-        # Track file.
+        # Record the file.
         if rel_path not in files_map:
             files_map[rel_path] = {"folder": folder, "name": file_name, "symbols": []}
         files_map[rel_path]["symbols"].append({
             "id": node_id, "name": symbol_name, "type": n_type,
         })
 
-        # Track folder.
+        # ...and the folder.
         if folder not in folders_map:
             folders_map[folder] = {"files": set(), "types": {}}
         folders_map[folder]["files"].add(rel_path)
         folders_map[folder]["types"][n_type] = folders_map[folder]["types"].get(n_type, 0) + 1
 
-    # Pass 2: Aggregate cross-folder call edges.
+    # Second pass: roll up the call edges that cross folder boundaries.
     folder_edges_map: dict[tuple[str, str], dict] = {}
 
     for src, tgt, data in graph.direct_graph.edges(data=True):
@@ -1116,7 +1595,7 @@ def _build_viz_data(graph: "CodeGraph", target_dir: Path) -> dict:
             folder_edges_map[key] = {"weight": 0, "calls": []}
         folder_edges_map[key]["weight"] += 1
 
-        # Record individual call details.
+        # Keep a few concrete calls behind each edge (capped so it stays light).
         if len(folder_edges_map[key]["calls"]) < 25:
             src_name = src.rsplit(":", 1)[-1] if ":" in src else src
             tgt_name = tgt.rsplit(":", 1)[-1] if ":" in tgt else tgt
@@ -1127,7 +1606,7 @@ def _build_viz_data(graph: "CodeGraph", target_dir: Path) -> dict:
                 "targetFile": tgt_parts[-1],
             })
 
-    # Build final JSON structure.
+    # Assemble the JSON payload the template consumes.
     folders_list = []
     for fid, info in sorted(folders_map.items()):
         symbol_count = sum(info["types"].values())
@@ -1232,3 +1711,55 @@ def export(
 
 if __name__ == "__main__":
     app()
+@app.command()
+def mcp(
+    project: str = typer.Argument(".", help="Path to the indexed project"),
+    # Kept only so existing scripts don't break: the server speaks MCP over
+    # stdio, which has no host or port. Hidden from --help.
+    port: Optional[int] = typer.Option(None, "--port", "-p", hidden=True),
+    host: Optional[str] = typer.Option(None, "--host", "-h", hidden=True),
+):
+    """
+    Start the Codetrace MCP server (stdio) for IDE integration.
+
+    This exposes code analysis tools to AI-powered IDEs like Cursor, VS Code, Claude Desktop, etc.
+    The IDE launches this command and talks to it over stdin/stdout.
+    """
+    # stdout carries the JSON-RPC stream, so every human-facing line goes to
+    # stderr — a banner on stdout would corrupt the protocol for the client.
+    err = Console(stderr=True, legacy_windows=False)
+    _print_banner(err)
+
+    if port is not None or host is not None:
+        err.print(
+            "[yellow]Note: --port/--host are ignored. The MCP server uses stdio "
+            "and is launched by your IDE, not reached over HTTP.[/yellow]"
+        )
+
+    # Check if project is indexed
+    project_path = Path(project).resolve()
+    db_dir = project_path / ".codetrace"
+
+    if not db_dir.exists():
+        err.print(f"[bold red]Error: No .codetrace directory found at {db_dir}[/bold red]")
+        err.print("Run 'codetrace index .' on the project first.")
+        raise typer.Exit(1)
+
+    err.print(f"[bold cyan]Starting MCP server (stdio) for project: {project_path}[/bold cyan]")
+    err.print()
+
+    # Import and start the MCP server
+    try:
+        from codetrace_mcp.server import main as mcp_main
+        import asyncio
+
+        # Run the MCP server
+        asyncio.run(mcp_main(project))
+
+    except ImportError as e:
+        err.print(f"[bold red]Error: MCP server not available[/bold red]")
+        err.print(f"Make sure codetrace_mcp is installed: {e}")
+        raise typer.Exit(1)
+    except Exception as e:
+        err.print(f"[bold red]MCP server error: {e}[/bold red]")
+        raise typer.Exit(1)

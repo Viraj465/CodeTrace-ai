@@ -113,7 +113,7 @@ class ChatStore:
             "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
             (session_id, role, content),
         )
-        # Update session timestamp and auto-title from the first user message.
+        # Bump the session's updated_at so it sorts to the top of the history list.
         self.conn.execute(
             "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?",
             (session_id,),
@@ -123,7 +123,7 @@ class ChatStore:
     def get_messages(self, session_id: str, limit: int | None = None) -> list[dict]:
         """Get messages for a session, optionally limited to the last N."""
         if limit:
-            # Get the last limit messages in chronological order.
+            # Grab the last `limit` messages, then flip them back to chronological order.
             rows = self.conn.execute("""
                 SELECT role, content FROM (
                     SELECT role, content, id FROM messages
