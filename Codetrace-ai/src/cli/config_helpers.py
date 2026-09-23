@@ -6,12 +6,18 @@ from pathlib import Path
 from rich.panel import Panel
 from rich.prompt import Prompt
 
+from ..config_io import write_private_json
+
+# We only match keys by their provider prefix. There used to be a generic
+# "long random token" pattern too, but it kept flagging commit SHAs, long
+# identifiers and slash-free paths as leaked keys and blocking perfectly good
+# one-word queries — so it's gone. If a key has no prefix we recognize, we let
+# it through; the occasional miss beats crying wolf constantly.
 _API_KEY_PATTERNS = [
-    re.compile(r"^sk-[A-Za-z0-9_-]{30,}$"),
-    re.compile(r"^sk-ant-[A-Za-z0-9_-]{30,}$"),
-    re.compile(r"^gsk_[A-Za-z0-9_-]{30,}$"),
-    re.compile(r"^AI[A-Za-z0-9_-]{35,}$"),
-    re.compile(r"^[A-Za-z0-9_-]{38,}$"),
+    re.compile(r"^sk-[A-Za-z0-9_-]{30,}$"),          # OpenAI / OpenRouter (sk-, sk-proj-, sk-or-)
+    re.compile(r"^sk-ant-[A-Za-z0-9_-]{30,}$"),      # Anthropic
+    re.compile(r"^gsk_[A-Za-z0-9_-]{30,}$"),         # Groq
+    re.compile(r"^AIza[A-Za-z0-9_-]{30,}$"),         # Google / Gemini (AIza prefix)
 ]
 
 
@@ -41,11 +47,9 @@ def mask_key(key: str) -> str:
     return key[:4] + "*" * (len(key) - 8) + key[-4:]
 
 
-# Provider base URLs for model listing
-# Mirrors the subset of PROVIDER_REGISTRY from retriever.py needed to hit
-# the /models endpoint. Kept here to avoid importing the heavy retriever
-# module during interactive config setup.
-
+# Just the base URLs we need to hit the /models endpoint — a small slice of
+# retriever.py's PROVIDER_REGISTRY, duplicated here so config setup doesn't have
+# to import that heavy module.
 _PROVIDER_BASE_URLS: dict[str, str] = {
     "openai":      "https://api.openai.com/v1",
     "groq":        "https://api.groq.com/openai/v1",
@@ -64,35 +68,53 @@ def _fetch_provider_models(
     provider: str,
     api_key: str,
     base_url: str = "",
+    api_style: str = "openai",
 ) -> list[str]:
     """
     Fetch the list of available model IDs from the provider's API.
 
-    Uses ``urllib.request`` (stdlib) so there's zero dependency risk during
-    first-time setup.  Returns an empty list on any error.
+    Uses stdlib ``urllib.request`` so first-time setup doesn't depend on any
+    third-party HTTP library. Returns an empty list if anything goes wrong —
+    the caller falls back to asking for a model name by hand, which is what
+    makes an unknown endpoint usable even when it exposes no listing route.
 
     Supported patterns:
-      - OpenAI-compatible: ``GET /models`` → ``{"data": [{"id": "..."}]}``
+      - OpenAI-compatible: ``GET {base_url}/models`` → ``{"data": [{"id": "..."}]}``
+      - Anthropic-style:   ``GET {base_url}/v1/models`` → ``{"data": [{"id": "..."}]}``
       - Ollama:            ``GET /api/tags`` → ``{"models": [{"name": "..."}]}``
       - Gemini:            ``GET /v1beta/models?key=...`` → ``{"models": [{"name": "models/..."}]}``
-      - Anthropic:         No listing endpoint — returns [].
+
+    ``api_style`` only matters for the custom provider, where the user picks the
+    wire format; the named providers imply their own.
     """
     import urllib.request
     import urllib.error
     import ssl
 
-    # Create a permissive SSL context (some corporate proxies break cert chains).
+    # Default SSL context — kept lenient because some corporate proxies mangle
+    # the cert chain.
     ctx = ssl.create_default_context()
 
     models: list[str] = []
 
     try:
-        if provider == "anthropic":
-            # Anthropic does not expose a /models endpoint.
-            return []
+        if provider == "anthropic" or (provider == "custom" and api_style == "anthropic"):
+            # Anthropic-style: base_url is the bare host, models live at /v1/models
+            # and auth is x-api-key rather than a bearer token.
+            actual_base = (base_url or "https://api.anthropic.com").rstrip("/")
+            url = f"{actual_base}/v1/models"
+            req = urllib.request.Request(url, method="GET")
+            req.add_header("x-api-key", api_key)
+            req.add_header("anthropic-version", "2023-06-01")
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                data = json.loads(resp.read())
+            for m in data.get("data", []):
+                model_id = m.get("id", "")
+                if model_id:
+                    models.append(model_id)
 
         elif provider == "ollama":
-            # Strip the /v1 suffix if present; /api/tags lives on the bare host.
+            # /api/tags sits on the bare host, so drop any /v1 suffix first.
             ollama_host = (base_url or "http://localhost:11434").rstrip("/")
             if ollama_host.endswith("/v1"):
                 ollama_host = ollama_host[:-3]
@@ -100,7 +122,7 @@ def _fetch_provider_models(
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
                 data = json.loads(resp.read())
-            # Ollama returns {"models": [{"name": "llama3.2:latest", ...}]}
+            # Shape: {"models": [{"name": "llama3.2:latest", ...}]}
             for m in data.get("models", []):
                 name = m.get("name", "")
                 if name:
@@ -109,12 +131,12 @@ def _fetch_provider_models(
         elif provider == "gemini":
             url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}"
             req = urllib.request.Request(url, method="GET")
-            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
                 data = json.loads(resp.read())
-            # Gemini returns {"models": [{"name": "models/gemini-2.0-flash", ...}]}
+            # Shape: {"models": [{"name": "models/gemini-2.0-flash", ...}]}
             for m in data.get("models", []):
                 full_name = m.get("name", "")
-                # Strip the "models/" prefix.
+                # Drop the "models/" prefix Gemini prepends.
                 model_id = full_name.removeprefix("models/") if full_name else ""
                 if model_id and "generateContent" in str(m.get("supportedGenerationMethods", [])):
                     models.append(model_id)
@@ -126,21 +148,24 @@ def _fetch_provider_models(
                 return []
             url = f"{actual_base}/models"
             req = urllib.request.Request(url, method="GET")
-            req.add_header("Authorization", f"Bearer {api_key}")
+            # A self-hosted endpoint may take no auth at all — sending an empty
+            # bearer token gets rejected by some gateways, so only send a real one.
+            if api_key:
+                req.add_header("Authorization", f"Bearer {api_key}")
             req.add_header("Content-Type", "application/json")
             with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
                 data = json.loads(resp.read())
-            # OpenAI-compatible returns {"data": [{"id": "model-name", ...}]}
+            # Shape: {"data": [{"id": "model-name", ...}]}
             for m in data.get("data", []):
                 model_id = m.get("id", "")
                 if model_id:
                     models.append(model_id)
 
     except Exception:
-        # Network error, bad key, timeout, JSON parse error are all handled.
+        # Network hiccup, bad key, timeout, malformed JSON — swallow them all.
         return []
 
-    # Filter out non-chat models (embeddings, whisper, tts, etc.).
+    # Drop the non-chat models (embeddings, whisper, tts, and so on).
     models = [
         m for m in models
         if not any(m.lower().startswith(p) for p in _NON_CHAT_PREFIXES)
@@ -150,8 +175,8 @@ def _fetch_provider_models(
     return models
 
 
-# Known model family prefixes for flat (non-namespaced) model names.
-# Used to group models by series when the ID doesn't contain '/'.
+# Family prefixes for flat (non-namespaced) model IDs — used to bucket models by
+# series when the ID has no '/' to split on.
 _KNOWN_FAMILIES = (
     "gpt-4o", "gpt-4", "gpt-3",  # OpenAI (match longer prefixes first)
     "o1", "o3", "o4",             # OpenAI reasoning
@@ -195,7 +220,7 @@ def _group_by_series(models: list[str]) -> dict[str, list[str]]:
                     key = fam
                     break
             if not key:
-                # Fallback: first segment before '-' or ':'.
+                # Nothing matched — fall back to the first chunk before -, : or .
                 key = model.split("-")[0].split(":")[0].split(".")[0]
 
         series.setdefault(key, []).append(model)
@@ -215,8 +240,6 @@ def _numbered_pick(items: list[str], label: str, console, allow_all: bool = Fals
         offset = 1
 
     for i, item in enumerate(items, start=1 + offset):
-        count_suffix = ""
-        # Try to show how many models a series key has.
         console.print(f"   [bold white]{i:>2}.[/bold white] {item}")
 
     console.print(f"   [dim] 0. Enter a custom {label}[/dim]\n")
@@ -243,23 +266,36 @@ def _numbered_pick(items: list[str], label: str, console, allow_all: bool = Fals
         console.print(f"   [red]Please enter a number between 0 and {max_idx}[/red]")
 
 
-def _pick_model(provider: str, api_key: str, base_url: str, console) -> str:
+def _pick_model(
+    provider: str,
+    api_key: str,
+    base_url: str,
+    console,
+    api_style: str = "openai",
+) -> str:
     """
     Fetch the provider's available models and present a picker.
 
-    When there are ≤20 models, shows a simple flat numbered list.
-    When there are >20 models, adds a two-step flow:
-      Step 3a → Pick a model series/family (e.g. Claude, GPT, Llama)
-      Step 3b → Pick the specific model within that series
+    Up to 20 models: one flat numbered list.
+    More than that: a two-step flow — first pick a series/family (Claude, GPT,
+    Llama, …), then pick the specific model inside it.
+
+    If the endpoint exposes no listing route, the user just types the model name
+    — which is all an unknown provider ever needs.
     """
     console.print(f"\n[dim]Fetching available models from {provider.upper()}...[/dim]")
-    models = _fetch_provider_models(provider, api_key, base_url)
+    models = _fetch_provider_models(provider, api_key, base_url, api_style)
 
     if not models:
-        console.print("[yellow]Could not fetch model list — enter the model name manually.[/yellow]")
-        return Prompt.ask("[cyan]3. Enter model name (or press Enter for default)[/cyan]", default="")
+        console.print("[yellow]Could not fetch a model list — enter the model name manually.[/yellow]")
+        name = ""
+        while not name:
+            name = Prompt.ask("[cyan]3. Enter model name[/cyan]", default="").strip()
+            if not name:
+                console.print("   [red]A model name is required.[/red]")
+        return name
 
-    # Small list: flat picker.
+    # Short enough to just list everything.
     if len(models) <= 20:
         console.print(f"\n[bold cyan]3. Select a model for [white]{provider.upper()}[/white] ({len(models)} available)[/bold cyan]\n")
         chosen = _numbered_pick(models, "model name", console)
@@ -267,11 +303,11 @@ def _pick_model(provider: str, api_key: str, base_url: str, console) -> str:
             return Prompt.ask("[cyan]Custom model name[/cyan]", default="")
         return chosen
 
-    # Large list: series to model two-step picker.
+    # Too many to scroll — group into series first.
     grouped = _group_by_series(models)
     series_keys = sorted(grouped.keys(), key=str.lower)
 
-    # Build display labels with counts.
+    # Label each series with its model count.
     series_labels = [f"{key}  [dim]({len(grouped[key])} models)[/dim]" for key in series_keys]
 
     console.print(
@@ -282,11 +318,11 @@ def _pick_model(provider: str, api_key: str, base_url: str, console) -> str:
     chosen_label = _numbered_pick(series_labels, "model name", console, allow_all=True)
 
     if chosen_label is None:
-        # User typed 0 for a custom model name.
+        # They typed 0 — let them enter a model name by hand.
         return Prompt.ask("[cyan]Custom model name[/cyan]", default="")
 
     if chosen_label == "__ALL__":
-        # Show all models flat (capped).
+        # "Show all" — dump a flat list, capped at 50.
         display = models[:50]
         console.print(f"\n[bold cyan]3b. Select a model ({len(models)} total)[/bold cyan]\n")
         if len(models) > 50:
@@ -296,7 +332,7 @@ def _pick_model(provider: str, api_key: str, base_url: str, console) -> str:
             return Prompt.ask("[cyan]Custom model name[/cyan]", default="")
         return chosen
 
-    # Map the display label back to the series key.
+    # Turn the chosen label back into its series key.
     series_idx = series_labels.index(chosen_label)
     series_key = series_keys[series_idx]
     series_models = sorted(grouped[series_key])
@@ -323,17 +359,78 @@ def run_setup_wizard(config_path: Path, console, is_reconfigure: bool = False) -
 
     api_key = ""
     base_url = ""
+    api_style = "openai"
 
     if provider == "ollama":
         console.print("[green]Ollama selected - no API key needed! Runs 100% locally.[/green]")
         base_url = Prompt.ask("[cyan]2. Ollama base URL[/cyan]", default="http://localhost:11434")
-        # Ensure the /v1 suffix is present for the OpenAI-compatible endpoint. Users often enter the bare host; the Ollama API lives at /v1.
+        # People usually type the bare host, but the OpenAI-compatible endpoint
+        # lives at /v1, so tack it on if it's missing.
         if base_url and not base_url.rstrip("/").endswith("/v1"):
             base_url = base_url.rstrip("/") + "/v1"
+    elif provider == "custom":
+        # No vendor is assumed here. The user names the endpoint and the wire
+        # format, which between them cover any provider that speaks either
+        # protocol — hosted or self-hosted.
+        console.print(
+            "[green]Custom provider — point Codetrace at any endpoint that speaks the "
+            "OpenAI or Anthropic API.[/green]"
+        )
+        api_style = Prompt.ask(
+            "[cyan]2. API style[/cyan]",
+            choices=["openai", "anthropic"],
+            default="openai",
+        )
+        if api_style == "anthropic":
+            console.print(
+                "   [dim]Requests go to {base_url}/v1/messages — give the bare host, "
+                "e.g. https://api.anthropic.com[/dim]"
+            )
+        else:
+            console.print(
+                "   [dim]Requests go to {base_url}/chat/completions — include the version "
+                "path, e.g. https://api.deepseek.com/v1[/dim]"
+            )
+        while not base_url:
+            base_url = Prompt.ask("[cyan]2a. API base URL[/cyan]", default="").strip().rstrip("/")
+            if not base_url:
+                console.print("   [red]A base URL is required for a custom provider.[/red]")
+        api_key = Prompt.ask(
+            "[cyan]2b. API key[/cyan] [dim](leave blank for a local or unauthenticated endpoint)[/dim]",
+            password=True,
+            default="",
+        )
     else:
         api_key = Prompt.ask(f"[cyan]2. Enter your {provider.upper()} API Key[/cyan]", password=True)
 
-    model_name = _pick_model(provider, api_key, base_url, console)
+    model_name = _pick_model(provider, api_key, base_url, console, api_style)
+    context_window = None
+    max_output_tokens = None
+
+    if provider != "ollama":
+        raw_context = Prompt.ask(
+            "[cyan]4. Context window[/cyan] "
+            "[dim](optional; leave blank to auto-detect)[/dim]",
+            default="",
+        ).strip()
+
+        if raw_context:
+            if not raw_context.isdigit() or int(raw_context) < 2048:
+                console.print("[yellow]Ignoring invalid context window; auto-detection will be used.[/yellow]")
+            else:
+                context_window = int(raw_context)
+
+        raw_output = Prompt.ask(
+            "[cyan]5. Max output tokens[/cyan] "
+            "[dim](optional; leave blank to auto-detect)[/dim]",
+            default="",
+        ).strip()
+
+        if raw_output:
+            if not raw_output.isdigit() or int(raw_output) < 128:
+                console.print("[yellow]Ignoring invalid output limit; auto-detection will be used.[/yellow]")
+            else:
+                max_output_tokens = int(raw_output)
 
     config_data = {
         "provider": provider.lower(),
@@ -341,11 +438,19 @@ def run_setup_wizard(config_path: Path, console, is_reconfigure: bool = False) -
         "model_name": model_name,
         "base_url": base_url,
     }
+    if context_window is not None:
+        config_data["context_window"] = context_window
+    if max_output_tokens is not None:
+        config_data["max_output_tokens"] = max_output_tokens
 
-    with open(config_path, "w") as f:
-        json.dump(config_data, f, indent=4)
+        
+    # Only meaningful for the custom provider; the named ones imply their style.
+    if provider == "custom":
+        config_data["api_style"] = api_style
 
-    console.print("[bold green]Configuration saved securely![/bold green]\n")
+    write_private_json(config_path, config_data)
+
+    console.print(f"[bold green]Configuration saved to {config_path}[/bold green]\n")
 
 
 def ensure_config(console) -> None:
@@ -360,42 +465,189 @@ def ensure_config(console) -> None:
     run_setup_wizard(config_path, console=console, is_reconfigure=False)
 
 
-def register_mcp(project_dir: Path) -> list[str]:
-    """Auto-register Codetrace MCP in Cursor and Claude Code configs."""
+# Registers our MCP server with the IDEs we know about.
+def _load_mcp_json(path: Path) -> tuple[dict | None, str | None]:
+    """
+    Read an existing MCP config. Returns (data, None), or (None, reason) when
+    the file can't be safely rewritten — most often VS Code-style JSON with
+    comments. We never overwrite a file we couldn't parse: doing so would
+    silently erase every other server the user configured there.
+    """
+    if not path.exists():
+        return {}, None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+        return None, f"not plain JSON ({e.__class__.__name__}) — left untouched"
+    if not isinstance(data, dict):
+        return None, "unexpected top-level JSON type — left untouched"
+    return data, None
+
+
+def _write_mcp_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def _is_codetrace_entry(config: object) -> bool:
+    """True for a server entry that an older codetrace wrote globally."""
+    if not isinstance(config, dict):
+        return False
+    args = [str(a) for a in config.get("args", [])]
+    return "--project" in args and any("codetrace_mcp" in a for a in args)
+
+
+def _remove_legacy_global_entries(server_names: list[str]) -> list[str]:
+    """
+    Older versions registered the server in ~/.cursor/mcp.json and
+    ~/.claude/mcp.json under a single global name, so every `init` re-pointed
+    all IDE sessions at the most recently initialised project (and Claude Code
+    never read that second file at all). Drop only entries we recognisably
+    wrote ourselves; anything else in those files is left alone.
+    """
     results = []
-
-    mcp_entry = {
-        "command": "python",
-        "args": [str(project_dir / "codetrace_mcp" / "server.py"), "--project", str(project_dir)],
-    }
-
-    targets = [
-        ("Cursor", Path.home() / ".cursor" / "mcp.json"),
-        ("Claude Code", Path.home() / ".claude" / "mcp.json"),
-    ]
-
-    for ide_name, config_path in targets:
+    for ide_name, path in (
+        ("Cursor (global)", Path.home() / ".cursor" / "mcp.json"),
+        ("Claude Code (legacy)", Path.home() / ".claude" / "mcp.json"),
+    ):
+        data, error = _load_mcp_json(path)
+        if error or not data:
+            continue
+        servers = data.get("mcpServers")
+        if not isinstance(servers, dict):
+            continue
+        stale = [n for n in server_names if _is_codetrace_entry(servers.get(n))]
+        if not stale:
+            continue
+        for name in stale:
+            del servers[name]
         try:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            if config_path.exists():
-                try:
-                    with open(config_path) as f:
-                        existing = json.load(f)
-                except (json.JSONDecodeError, ValueError):
-                    existing = {}
-            else:
-                existing = {}
+            _write_mcp_json(path, data)
+            results.append(f"[dim]• {ide_name}: removed old global entry from {path}[/dim]")
+        except OSError as e:
+            results.append(f"[yellow]⚠ {ide_name}: could not clean {path}: {e}[/yellow]")
+    return results
 
-            if "mcpServers" not in existing:
-                existing["mcpServers"] = {}
 
-            existing["mcpServers"]["codetrace"] = mcp_entry
+def register_mcp(servers: dict[str, dict], workspace_dir: Path | None = None) -> list[str]:
+    """Register MCP servers with Claude Code, Cursor and VS Code.
 
-            with open(config_path, "w") as f:
-                json.dump(existing, f, indent=2)
+    With ``workspace_dir`` (the normal case — ``init`` / ``register-mcp``) the
+    entries go into the project's own config files, so each project gets a
+    server bound to *its* index instead of one global entry that the latest
+    ``init`` keeps re-pointing:
+      - Claude Code  → <project>/.mcp.json          { "mcpServers": {...} }
+      - Cursor       → <project>/.cursor/mcp.json   { "mcpServers": {...} }
+      - VS Code      → <project>/.vscode/mcp.json   { "servers": { name: { "type": "stdio", ... } } }
 
+    Without ``workspace_dir`` there is no project to scope to, so only Cursor's
+    global ~/.cursor/mcp.json is updated.
+
+    Existing files are merged into, never replaced; a file that isn't plain
+    JSON (e.g. has comments) is skipped with a warning rather than clobbered.
+    """
+    if workspace_dir is not None:
+        targets = [
+            ("Claude Code", workspace_dir / ".mcp.json", "mcpServers", False),
+            ("Cursor", workspace_dir / ".cursor" / "mcp.json", "mcpServers", False),
+            ("VS Code", workspace_dir / ".vscode" / "mcp.json", "servers", True),
+        ]
+    else:
+        targets = [("Cursor (global)", Path.home() / ".cursor" / "mcp.json", "mcpServers", False)]
+
+    results = []
+    for ide_name, config_path, key, needs_type in targets:
+        existing, error = _load_mcp_json(config_path)
+        if error:
+            results.append(
+                f"[yellow]⚠ {ide_name}: {config_path} is {error}. "
+                f"Add the 'codetrace' server there manually.[/yellow]"
+            )
+            continue
+        try:
+            section = existing.setdefault(key, {})
+            if not isinstance(section, dict):
+                results.append(
+                    f"[yellow]⚠ {ide_name}: '{key}' in {config_path} is not an object "
+                    f"— left untouched.[/yellow]"
+                )
+                continue
+            for server_name, config in servers.items():
+                # VS Code requires an explicit "type": "stdio".
+                section[server_name] = {"type": "stdio", **config} if needs_type else config
+            _write_mcp_json(config_path, existing)
             results.append(f"[green]✓ {ide_name}:[/green] {config_path}")
-        except Exception as e:
+        except OSError as e:
             results.append(f"[yellow]⚠ {ide_name}: {e}[/yellow]")
 
+    if workspace_dir is not None:
+        results.extend(_remove_legacy_global_entries(list(servers)))
     return results
+
+
+def discover_mcp_servers() -> dict[str, dict]:
+    """Discover MCP servers from existing IDE configurations."""
+    discovered = {}
+    # Same IDE list as register_mcp, VS Code included, so we pick up servers
+    # defined there too.
+    targets = [
+        Path.home() / ".cursor" / "mcp.json",
+        Path.home() / ".claude" / "mcp.json",
+        Path.home() / ".vscode" / "mcp.json",
+    ]
+
+    for path in targets:
+        if path.exists():
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                    servers = data.get("mcpServers", {})
+                    discovered.update(servers)
+            except (json.JSONDecodeError, ValueError):
+                continue
+    return discovered
+
+
+def sync_mcp_configs(console) -> None:
+    """Interactively discover and sync MCP servers across IDEs."""
+    discovered = discover_mcp_servers()
+    if not discovered:
+        console.print("[yellow]No existing MCP servers discovered to sync.[/yellow]")
+        return
+
+    console.print(Panel(f"[bold cyan]Found {len(discovered)} MCP servers in your configs[/bold cyan]"))
+    
+    server_names = sorted(discovered.keys())
+    for i, name in enumerate(server_names, 1):
+        console.print(f"  [bold white]{i}.[/bold white] {name}")
+
+    choice = Prompt.ask(
+        "\n[cyan]Enter numbers to sync (comma-separated), 'all' for all, or 'none' to skip[/cyan]",
+        default="none"
+    ).strip().lower()
+
+    if choice == "none" or not choice:
+        return
+    
+    selected_servers = {}
+    if choice == "all":
+        selected_servers = discovered
+    else:
+        try:
+            indices = [int(x.strip()) - 1 for x in choice.split(",") if x.strip().isdigit()]
+            for idx in indices:
+                if 0 <= idx < len(server_names):
+                    name = server_names[idx]
+                    selected_servers[name] = discovered[name]
+        except ValueError:
+            console.print("[red]Invalid input. Skipping sync.[/red]")
+            return
+
+    if selected_servers:
+        results = register_mcp(selected_servers)
+        for res in results:
+            console.print(res)
+        console.print("[bold green]✓ MCP servers synced successfully![/bold green]")

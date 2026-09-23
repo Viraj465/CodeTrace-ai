@@ -6,25 +6,24 @@ import pathspec
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-# Hardcoded safety net.
-# These directories are skipped during indexing, even if not in .gitignore.
-# They are not user source code and contain many files that reduce indexing performance.
+# Safety net: always skip these during indexing even if .gitignore doesn't list them.
+# None of it is user source, and most of it is huge, so scanning it just wastes time.
 
 ALWAYS_IGNORE_DIRS: set[str] = {
-    # Version control systems
+    # Version control
     ".git",
     ".hg",
     ".svn",
     ".github",
     ".vscode",
-    # Codetrace internal data
+    # Codetrace's own data
     ".codetrace",
-    # Javascript and Node environments
+    # JS / Node
     "node_modules",
     "bower_components",
     ".next",
     ".nuxt",
-    # Python virtual environments and caches
+    # Python virtualenvs and caches
     "venv",
     ".venv",
     "env",
@@ -43,13 +42,13 @@ ALWAYS_IGNORE_DIRS: set[str] = {
     ".expo",
     ".kotlin",
     "Pods",
-    # Editor and IDE configurations
+    # Editor / IDE config
     ".idea",
     ".vs",
-    # Dependencies for Go, Rust, PHP, Ruby
+    # Go / Rust / PHP / Ruby dependency dirs
     "vendor",
     "target",
-    # Miscellaneous files
+    # Misc
     "coverage",
     ".cache",
     ".tox",
@@ -57,43 +56,83 @@ ALWAYS_IGNORE_DIRS: set[str] = {
 }
 
 
+# Extensions that are never source and should never be scanned, indexed, or
+# snapshotted, even if they somehow slip past language detection.
+ALWAYS_IGNORE_EXTENSIONS: set[str] = {
+    ".pdf",
+}
+
+
 def _is_always_ignored(dir_name: str) -> bool:
-    """Return True if ``dir_name`` is in the hardcoded skip-set."""
+    """
+    True if ``dir_name`` should be skipped during scanning.
+
+    We skip anything in ``ALWAYS_IGNORE_DIRS``, plus any dot-directory. Dot-dirs
+    (.git, .venv, .pytest_cache, .idea, .vscode, .mypy_cache, …) are nearly always
+    tooling folders rather than user source, so catching them by prefix saves us
+    from having to enumerate every one.
+    """
+    if dir_name.startswith("."):
+        return True
     return dir_name in ALWAYS_IGNORE_DIRS
+
+
+def _is_always_ignored_file(file_name: str) -> bool:
+    """Return True if a file should be skipped during scanning (by extension)."""
+    return Path(file_name).suffix.lower() in ALWAYS_IGNORE_EXTENSIONS
+
+
+def _scope_gitignore_pattern(line: str, rel_dir: str) -> str:
+    """
+    Rewrite one pattern from the ``.gitignore`` in ``rel_dir`` so it matches
+    repo-root-relative paths the way git would apply it.
+
+    Git's rules: a pattern containing a slash (other than a trailing one) is
+    anchored to the directory of its ``.gitignore``; a pattern without one
+    matches at any depth *below that directory* — never outside it. Root
+    patterns are already in that frame, and gitwildmatch anchors a leading
+    '/' itself, so they pass through untouched.
+    """
+    if not rel_dir or rel_dir == ".":
+        return line
+
+    negate = line.startswith("!")
+    body = line[1:] if negate else line
+    if "/" in body.rstrip("/"):
+        scoped = f"{rel_dir}/{body.lstrip('/')}"
+    else:
+        scoped = f"{rel_dir}/**/{body}"
+    return f"!{scoped}" if negate else scoped
 
 
 def read_gitignore(root_dir="."):
     """
-    Walk the repo tree and collect patterns from **all** ``.gitignore`` files,
-    not just the root one.  This mirrors how Git itself works — each nested
-    ``.gitignore`` applies to its own subtree.
+    Collect patterns from every ``.gitignore`` in the tree, not just the root one.
+    Git works the same way: each nested ``.gitignore`` applies to its own subtree.
 
-    Additionally, the hardcoded ``ALWAYS_IGNORE_DIRS`` set is injected so that
-    common non-source folders (node_modules, venv, __pycache__, …) are always
-    excluded even if no ``.gitignore`` mentions them.
+    We also inject ``ALWAYS_IGNORE_DIRS`` up front, so common junk folders
+    (node_modules, venv, __pycache__, …) stay excluded even when no ``.gitignore``
+    mentions them.
 
-    Returns a ``pathspec.PathSpec`` object that can be used with
+    Returns a ``pathspec.PathSpec`` you can query with
     ``spec.match_file(relative_posix_path)``.
     """
     root_path = Path(root_dir).resolve()
 
-    # Seed with hardcoded always-ignore patterns.
-    # The trailing slash tells gitwildmatch to match directories.
+    # Seed with the always-ignore dirs. The trailing slash tells gitwildmatch
+    # these are directories.
     patterns: list[str] = [f"{d}/" for d in sorted(ALWAYS_IGNORE_DIRS)]
 
-    # Walk the repository and collect every .gitignore file.
-    # We prune ALWAYS_IGNORE_DIRS from the walk so we do not
-    # descend into large folders like node_modules/ or venv/.
     for dirpath, dirnames, filenames in os.walk(root_path):
-        # Prune always-ignored directories from the walk in-place
-        # so os.walk does not enter them. This improves performance.
+        # Prune ignored dirs in-place so os.walk never descends into them
+        # (keeps us out of node_modules/, venv/, and friends).
         dirnames[:] = [d for d in dirnames if not _is_always_ignored(d)]
 
         if ".gitignore" not in filenames:
             continue
 
         gitignore_path = Path(dirpath) / ".gitignore"
-        # Relative path from the repo root to the directory containing this .gitignore
+        # Path from the repo root down to the dir holding this .gitignore.
         try:
             rel_dir = Path(dirpath).relative_to(root_path).as_posix()
         except ValueError:
@@ -103,26 +142,13 @@ def read_gitignore(root_dir="."):
             with open(gitignore_path, "r", encoding="utf-8", errors="replace") as f:
                 for raw_line in f:
                     line = raw_line.strip()
-                    # Skip empty lines and comments in the .gitignore
+                    # Blank lines and comments don't count.
                     if not line or line.startswith("#"):
                         continue
 
-                    # If this .gitignore is in a subdirectory, prefix anchored patterns
-                    # with the subdirectory's path. This ensures they match correctly 
-                    # against repo-root-relative paths.
-                    if rel_dir and rel_dir != ".":
-                        if line.startswith("/"):
-                            # Anchored pattern: /foo becomes subdir/foo
-                            patterns.append(f"{rel_dir}{line}")
-                        else:
-                            # Unanchored patterns: match anywhere below the .gitignore's directory. 
-                            # We add them as-is, and pathspec gitwildmatch will match them.
-                            patterns.append(line)
-                    else:
-                        # For the root .gitignore, strip optional leading '/' and add it.
-                        patterns.append(line.lstrip("/") if line.startswith("/") else line)
+                    patterns.append(_scope_gitignore_pattern(line, rel_dir))
         except Exception:
-            # Skip unreadable .gitignore files
+            # A .gitignore we can't read just gets skipped.
             pass
 
     spec = pathspec.PathSpec.from_lines("gitwildmatch", patterns)

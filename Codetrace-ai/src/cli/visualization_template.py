@@ -1,16 +1,15 @@
 """
-CodeTrace Architecture Visualization — HTML Template.
+CodeTrace architecture visualization — the HTML template.
 
-Generates a self-contained HTML file using D3.js that renders
-an interactive folder-level dependency map of the codebase.
-
-Layer 1: Force-directed graph of folders with cross-folder call edges.
-Layer 3: Click-to-open sidebar showing files, symbols, and connections.
+Builds one self-contained HTML file (D3.js baked in) that draws an interactive,
+folder-level dependency map of the codebase. Two pieces: a force-directed graph
+of folders wired together by cross-folder call edges, and a click-to-open sidebar
+that lists a folder's files, symbols, and connections.
 """
 import json
 
 
-# Shared type-color palette (matches the JavaScript side)
+# Type-to-color palette, kept in sync with the copy on the JavaScript side.
 TYPE_COLORS = {
     "function": "#22d3ee",
     "class":    "#fb923c",
@@ -30,7 +29,7 @@ def render(data: dict) -> str:
     :returns: Complete HTML string (utf-8 safe, self-contained)
     """
     json_str = json.dumps(data, ensure_ascii=False)
-    # Prevent accidental closing script tags inside the JSON payload.
+    # Escape "</" so a string in the data can't accidentally close the <script> tag.
     json_str = json_str.replace("</", "<\\/")
 
     html = _TEMPLATE

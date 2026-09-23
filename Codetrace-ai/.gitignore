@@ -1,0 +1,29 @@
+# ── Documents ────────────────────────────────────────────────
+# Ignore PDFs (exported docs, generated reports, etc.)
+*.pdf
+
+# ── Auto-generated dot-folders (tooling / caches, not source) ─
+.codetrace/
+.venv/
+.env/
+.idea/
+.vscode/
+.vs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.nox/
+.tox/
+.cache/
+.ipynb_checkpoints/
+.hypothesis/
+.DS_Store
+
+# ── Python bytecode / build artifacts ────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.egg-info/
+*.egg

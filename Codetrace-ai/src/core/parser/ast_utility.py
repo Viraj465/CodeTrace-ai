@@ -60,7 +60,7 @@ def extract_name_from_definition(node, source_bytes: bytes) -> Optional[str]:
     """
     for child in node.children:
         if "identifier" in child.type:
-            return node_text(child, source_bytes)  # Use node_text instead of the duplicate function
+            return node_text(child, source_bytes)
     return None
 
 
@@ -87,6 +87,14 @@ FUNCTION_NODE_TYPES = {
 }
 
 QUERY_DIR = Path(__file__).parent / "queries"
+
+# Values that make a JS/TS `variable_declarator` a function definition.
+_FUNCTION_VALUE_TYPES = {
+    "arrow_function",
+    "function_expression",
+    "function",
+    "generator_function",
+}
 
 
 def _is_word_char(ch: str) -> bool:
@@ -285,7 +293,6 @@ def build_qualified_name(
         function -> login
         method   -> AuthService.login
     """
-    # Handle properly formatted line breaks
     func_name = resolve_function_name(node, source_code)
     if not func_name:
         return "<anonymous>"
@@ -316,6 +323,15 @@ def resolve_enclosing_function(
         _, function_node_types = get_structure_node_types(language_name)
 
     fn_node = find_parent_of_type(node, function_node_types)
+    # JS/TS queries register `variable_declarator` as a function node so that
+    # `const f = () => …` is a symbol. But most declarators hold plain values:
+    # the call in `const x = compute()` belongs to the enclosing function, not
+    # to a phantom caller named "x". Keep climbing past those.
+    while fn_node is not None and fn_node.type == "variable_declarator":
+        value = fn_node.child_by_field_name("value")
+        if value is not None and value.type in _FUNCTION_VALUE_TYPES:
+            break
+        fn_node = find_parent_of_type(fn_node, function_node_types)
     if not fn_node:
         return None
 

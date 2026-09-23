@@ -1,5 +1,6 @@
 ﻿import colorsys
 from collections import OrderedDict
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from rich.panel import Panel
@@ -7,13 +8,18 @@ from rich.prompt import Prompt
 from rich.text import Text
 
 CODETRACE_LOGO = r"""
-                                           ___       ____________
-                  ______                  /  /      /____   ____/_  ___________      _______
-                /  ____/ ______   _______/  /______    /  /    /  \/____/  ___ `/   /  ____/______
-               /  /     /  ___ \ /  ___    /   _   \  /  /    /  /     / /   / /   /  /    /   __ \
-              /  /____ /  /__/  /  /__/   /   _____/ /  /    /  /     / /___/   \ /  /____/  _____/ 
-              \______/ \_______/\___,____/\_______/ /__/    /__/      \___,__ /\__\_______/\______/
-                """
+ ██████  ██████  ██████  ███████ ████████ ██████   █████   ██████ ███████
+██      ██    ██ ██   ██ ██         ██    ██   ██ ██   ██ ██      ██
+██      ██    ██ ██   ██ █████      ██    ██████  ███████ ██      █████
+██      ██    ██ ██   ██ ██         ██    ██   ██ ██   ██ ██      ██
+ ██████  ██████  ██████  ███████    ██    ██   ██ ██   ██  ██████ ███████"""
+
+
+def _installed_version() -> str:
+    try:
+        return version("codetrace-ai")
+    except PackageNotFoundError:
+        return "dev"
 
 
 def print_banner(console) -> None:
@@ -31,10 +37,17 @@ def print_banner(console) -> None:
             rich_text.append(char, style=hex_color)
         console.print(rich_text)
 
-    console.print("  [bold dark_orange]Autonomous System Architect v1.0[/bold dark_orange]")
+    # Tagline block, indented to sit under the wordmark.
     console.print(
-        "  [bold cyan]Help shape Codetrace:[/bold cyan] "
-        "[underline blue]https://github.com/Viraj465/CodeTrace-ai/discussions/5#discussion-9684949[/underline blue]\n"
+        "  [bold dark_orange]⚡ Autonomous System Architect[/bold dark_orange]"
+        f"  [dim]·  v{_installed_version()}[/dim]"
+    )
+    console.print(
+        "  [dim]Local-first code intelligence — call graphs · blast-radius · semantic search[/dim]"
+    )
+    console.print(
+        "  [cyan]Shape Codetrace →[/cyan] "
+        "[underline blue]https://github.com/Viraj465/CodeTrace-ai/discussions/5[/underline blue]\n"
     )
 
 
@@ -47,23 +60,21 @@ def show_diff_panel(console, pending: dict) -> bool:
     from rich.text import Text as RichText
 
     if is_new:
-        title = f"New File: {Path(file_path).name}"
+        content_lines = pending["content"].splitlines()
+        title = f"New File: {Path(file_path).name} ({len(content_lines)} lines)"
         diff_text = RichText()
-        for line in pending["content"].splitlines()[:40]:
+        # Print the whole file with 1-based line numbers — don't hide anything.
+        width = len(str(len(content_lines))) or 1
+        for i, line in enumerate(content_lines, start=1):
+            diff_text.append(f"{i:>{width}} ", style="dim")
             diff_text.append(f"+ {line}\n", style="green")
-        if len(pending["content"].splitlines()) > 40:
-            diff_text.append(
-                f"  ... ({len(pending['content'].splitlines())} total lines)\n",
-                style="dim",
-            )
     else:
         title = f"Proposed Edit: {Path(file_path).name}"
         diff_text = RichText()
-        shown = 0
+        # Render the full unified diff, git-diff style. The @@ hunk headers carry
+        # the old/new line numbers so you can place every change. Nothing gets
+        # truncated; a big diff just scrolls like `git diff` would.
         for line in diff_lines:
-            if shown > 60:
-                diff_text.append(f"  ... ({len(diff_lines)} total diff lines)\n", style="dim")
-                break
             line_clean = line.rstrip("\n").rstrip("\r")
             if line_clean.startswith("+++") or line_clean.startswith("---"):
                 diff_text.append(f"{line_clean}\n", style="bold")
@@ -75,7 +86,6 @@ def show_diff_panel(console, pending: dict) -> bool:
                 diff_text.append(f"{line_clean}\n", style="cyan")
             else:
                 diff_text.append(f"{line_clean}\n")
-            shown += 1
 
     console.print()
     console.print(

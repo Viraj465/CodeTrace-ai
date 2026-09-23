@@ -5,15 +5,21 @@ Tracks file hashes and modification timestamps to identify changes.
 
 import hashlib
 import json
+import os
 import logging
 from pathlib import Path
 from typing import Optional, List, Any
 
-# Use relative imports so IDEs resolve them correctly within the package.
+# Relative imports so IDEs resolve them correctly within the package.
 from .db_utils import get_db_connection
 from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
+
+
+def _casefold_path(posix_path: str) -> str:
+    """Case-insensitive on Windows (like its filesystem), exact elsewhere."""
+    return posix_path.lower() if os.name == "nt" else posix_path
 
 
 class SyncManager:
@@ -180,28 +186,37 @@ class SyncManager:
             conn.commit()
 
     def get_file_snapshot(self, filepath: str | Path) -> Optional[dict[str, Any]]:
+        """
+        Fetch a snapshot by exact stored path, or else by a path suffix that
+        lines up on a directory boundary ("src/a.py" matches ".../src/a.py" but
+        never ".../src/data.py"). A suffix matching more than one file is
+        ambiguous and returns None rather than guessing.
+        """
         fp = str(filepath)
+        columns = "filepath, filehash, content, line_count, size_bytes, is_truncated"
         with get_db_connection(self.db_path) as conn:
             row = conn.execute(
-                """
-                SELECT filepath, filehash, content, line_count, size_bytes, is_truncated
-                FROM file_snapshots
-                WHERE filepath = ?
-                """,
+                f"SELECT {columns} FROM file_snapshots WHERE filepath = ?",
                 (fp,),
             ).fetchone()
 
             if row is None:
-                row = conn.execute(
-                    """
-                    SELECT filepath, filehash, content, line_count, size_bytes, is_truncated
-                    FROM file_snapshots
-                    WHERE filepath LIKE ?
-                    ORDER BY LENGTH(filepath) ASC
-                    LIMIT 1
-                    """,
-                    (f"%{fp}",),
-                ).fetchone()
+                want = _casefold_path(Path(fp).as_posix().lstrip("/"))
+                while want.startswith("./"):
+                    want = want[2:]
+                # Narrow in SQL on the bare filename (LIKE wildcards escaped),
+                # then apply the exact boundary rule in Python.
+                name = Path(fp).name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                candidates = conn.execute(
+                    f"SELECT {columns} FROM file_snapshots WHERE filepath LIKE ? ESCAPE '\\'",
+                    (f"%{name}",),
+                ).fetchall()
+                matches = []
+                for cand in candidates:
+                    stored = _casefold_path(Path(cand[0]).as_posix())
+                    if want and (stored == want or stored.endswith("/" + want)):
+                        matches.append(cand)
+                row = matches[0] if len(matches) == 1 else None
 
         if not row:
             return None
