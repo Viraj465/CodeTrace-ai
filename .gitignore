@@ -65,3 +65,5 @@ planning
 .cursor/
 .mcp.json
 *.cast
+screenshot*.png
+WEBSITE_*.md
